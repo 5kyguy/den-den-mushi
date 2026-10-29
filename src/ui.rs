@@ -4,7 +4,7 @@
 use gtk4 as gtk;
 
 use crate::gaps::{self, Insets};
-use crate::model::{IconSource, Note, REASON_DISMISSED, REASON_EXPIRED};
+use crate::model::{display_app, IconSource, Note, REASON_DISMISSED, REASON_EXPIRED};
 use crate::server::{UiCommand, UiEvent};
 use crate::theme::{self, Settings};
 use gtk::gdk::MemoryFormat;
@@ -94,6 +94,7 @@ struct LiveCard {
     body: gtk::Label,
     actions: gtk::Box,
     progress: gtk::Box,
+    close: gtk::Button,
     icon_slot: gtk::Box,
     expire_ms: Option<u64>,
     remaining_ms: f64,
@@ -158,7 +159,8 @@ impl Shell {
             eprintln!("den-den-mushi: layer shell is unavailable; using an ordinary window");
         }
 
-        let column = gtk::Box::new(Orientation::Vertical, settings.gap);
+        // The 8px stack gap is `.toast { margin-bottom: 8px }` in the stylesheet.
+        let column = gtk::Box::new(Orientation::Vertical, 0);
         column.set_halign(Align::End);
         column.set_valign(Align::Start);
         window.set_child(Some(&column));
@@ -223,6 +225,7 @@ impl Shell {
         let mut finished = Vec::new();
         for card in &mut self.cards {
             step_motion(card);
+            update_hover(card);
             if !card.leaving && !card.paused.get() {
                 if let Some(total) = card.expire_ms {
                     card.remaining_ms = (card.remaining_ms - 16.0).max(0.0);
@@ -433,10 +436,7 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     edge.set_vexpand(true);
 
     let content = gtk::Box::new(Orientation::Vertical, 0);
-    content.set_margin_top(10);
-    content.set_margin_bottom(8);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
+    content.add_css_class("content");
     content.set_hexpand(true);
 
     let header = gtk::Box::new(Orientation::Horizontal, 6);
@@ -458,6 +458,12 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     let close = gtk::Button::with_label("×");
     close.add_css_class("close");
     close.set_valign(Align::Center);
+    // Hidden until the pointer is over the card. GTK 4.14 does not let a
+    // later CSS opacity rule override `button.close { opacity: 0 }`, so the
+    // daemon sets the widget opacity directly. can_target stays off so the
+    // invisible button cannot take the click.
+    close.set_opacity(0.0);
+    close.set_can_target(false);
     let commands_close = commands.clone();
     let close_id = note.id;
     close.connect_clicked(move |_| {
@@ -474,29 +480,17 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
 
     let title = gtk::Label::new(Some(&note.summary));
     title.add_css_class("title");
-    title.set_wrap(true);
-    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    title.set_lines(2);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_xalign(0.0);
-    title.set_halign(Align::Fill);
-    title.set_margin_top(4);
+    clamp_lines(&title, 1);
     title.set_visible(!note.summary.is_empty());
 
     let body = gtk::Label::new(None);
     body.add_css_class("body");
-    body.set_wrap(true);
-    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    body.set_lines(4);
-    body.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    body.set_xalign(0.0);
-    body.set_halign(Align::Fill);
-    body.set_margin_top(2);
+    clamp_lines(&body, 3);
     set_body(&body, &note.body);
     body.set_visible(!note.body.is_empty());
 
     let actions = gtk::Box::new(Orientation::Horizontal, 6);
-    actions.set_margin_top(8);
+    actions.add_css_class("actions");
     actions.set_visible(!note.actions.is_empty());
     let commands_actions = commands.clone();
     let action_id = note.id;
@@ -524,26 +518,13 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     root.append(&progress_track);
 
     let slide = SlideBin::new();
+    slide.add_css_class("toast");
     slide.set_overflow(Overflow::Hidden);
     slide.set_child(Some(root.upcast_ref()));
     slide.set_offset(SLIDE_DISTANCE);
     slide.set_opacity(0.0);
 
     let paused = Rc::new(Cell::new(false));
-    let motion_controller = gtk::EventControllerMotion::new();
-    let paused_enter = Rc::clone(&paused);
-    let root_enter = root.clone();
-    motion_controller.connect_enter(move |_, _, _| {
-        paused_enter.set(true);
-        root_enter.add_css_class("hover");
-    });
-    let paused_leave = Rc::clone(&paused);
-    let root_leave = root.clone();
-    motion_controller.connect_leave(move |_| {
-        paused_leave.set(false);
-        root_leave.remove_css_class("hover");
-    });
-    root.add_controller(motion_controller);
 
     let click = gtk::GestureClick::new();
     click.set_button(gdk::BUTTON_PRIMARY);
@@ -590,6 +571,7 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
         body,
         actions,
         progress,
+        close,
         icon_slot,
         expire_ms: note.expire_ms,
         remaining_ms: note.expire_ms.unwrap_or(0) as f64,
@@ -616,13 +598,67 @@ fn is_button(widget: &gtk::Widget) -> bool {
     false
 }
 
-fn display_app(name: &str) -> String {
-    let name = name.trim();
-    if name.is_empty() {
-        "NOTIFY".into()
+fn clamp_lines(label: &gtk::Label, lines: i32) {
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_lines(lines);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    // A tiny natural width lets the 380px card allocate the label, so the
+    // ellipsis happens at the card edge instead of the card growing.
+    label.set_max_width_chars(1);
+    label.set_hexpand(true);
+    label.set_halign(Align::Fill);
+    label.set_xalign(0.0);
+}
+
+fn update_hover(card: &LiveCard) {
+    let over = pointer_over(&card.root);
+    if over {
+        card.root.add_css_class("hover");
+        card.close.add_css_class("shown");
+        card.close.set_opacity(1.0);
+        card.close.set_can_target(true);
     } else {
-        name.to_uppercase()
+        card.root.remove_css_class("hover");
+        card.close.remove_css_class("shown");
+        card.close.set_opacity(0.0);
+        card.close.set_can_target(false);
     }
+    card.paused.set(over);
+}
+
+/// True when the seat pointer is inside `widget`, including its children.
+/// Enter/leave on the card itself flickers when the pointer moves onto the
+/// close button, so the hover state is the pointer position.
+fn pointer_over(widget: &impl IsA<gtk::Widget>) -> bool {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    let Some(root) = widget.root() else {
+        return false;
+    };
+    let Some(native) = root.native() else {
+        return false;
+    };
+    let Some(surface) = native.surface() else {
+        return false;
+    };
+    let display = widget.display();
+    let Some(seat) = display.default_seat() else {
+        return false;
+    };
+    let Some(pointer) = seat.pointer() else {
+        return false;
+    };
+    let Some((x, y, _)) = surface.device_position(&pointer) else {
+        return false;
+    };
+    let root_widget = root.upcast_ref::<gtk::Widget>();
+    let Some(point) = root_widget.compute_point(widget, &graphene::Point::new(x as f32, y as f32))
+    else {
+        return false;
+    };
+    let width = widget.width() as f32;
+    let height = widget.height() as f32;
+    point.x() >= 0.0 && point.y() >= 0.0 && point.x() < width && point.y() < height
 }
 
 fn format_time(unix: i64) -> String {

@@ -1,9 +1,9 @@
 //! Screen insets from Hyprland.
 //!
-//! The r2-d2 shell treats `general:gaps_out / 2` as the distance from a
-//! panel to the screen edge, and pushes toasts below the bar. Layer-shell
-//! anchors sit on the output edge, so the reserved top (the bar's exclusive
-//! zone) is added on top of that inset. Card spacing itself stays 8px.
+//! Layer-shell anchors sit on the monitor edge, so the stack is pushed in by
+//! the full `general:gaps_out` (the same outer gap tiled windows clear) and
+//! by the monitor's reserved top (the bar's exclusive zone). The 8px gap
+//! between cards lives in the stylesheet, not here.
 
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ pub fn resolve_insets(
     gaps_json: Option<&str>,
     monitors_json: Option<&str>,
 ) -> Insets {
-    let auto = gaps_json.and_then(parse_gaps_out_half).unwrap_or(8);
+    let auto = gaps_json.and_then(parse_gaps_out).unwrap_or(8);
     let margin = margin_override.unwrap_or(auto).max(0);
     let reserved = monitors_json
         .and_then(parse_top_reserved)
@@ -30,15 +30,16 @@ pub fn resolve_insets(
     }
 }
 
-/// First number of `general:gaps_out`, halved the way the shell does.
-pub fn parse_gaps_out_half(json: &str) -> Option<i32> {
+/// First number of `general:gaps_out`, used whole so the cards clear the
+/// outer gap instead of sitting halfway into it.
+pub fn parse_gaps_out(json: &str) -> Option<i32> {
     let value: Value = serde_json::from_str(json).ok()?;
     let full = if let Some(css) = value.get("css").and_then(|item| item.as_str()) {
         first_number(css)?
     } else {
         value.get("int")?.as_i64()? as i32
     };
-    Some((full / 2).max(0))
+    Some(full.max(0))
 }
 
 /// `hyprctl monitors -j` reports `reserved` as top, bottom, left, right.
@@ -77,11 +78,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gaps_are_halved_and_reserved_top_is_added() {
+    fn outer_gap_and_reserved_top_are_added() {
         let gaps = r#"{"option":"general:gaps_out","int":2,"css":"2"}"#;
         let monitors = r#"[{"name":"eDP-1","focused":false,"reserved":[0,0,0,0]},{"name":"DP-1","focused":true,"reserved":[26,0,0,0]}]"#;
         let insets = resolve_insets(None, Some(gaps), Some(monitors));
-        assert_eq!(insets, Insets { top: 27, right: 1 });
+        assert_eq!(insets, Insets { top: 28, right: 2 });
     }
 
     #[test]

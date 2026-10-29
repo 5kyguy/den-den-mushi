@@ -147,7 +147,6 @@ pub fn write_dnd(on: bool) -> std::io::Result<()> {
 #[derive(Debug, Default, Deserialize)]
 pub struct FileConfig {
     pub margin: Option<i32>,
-    pub gap: Option<i32>,
     pub namespace: Option<String>,
     pub timeout_low_ms: Option<u64>,
     pub timeout_normal_ms: Option<u64>,
@@ -156,7 +155,6 @@ pub struct FileConfig {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub margin: Option<i32>,
-    pub gap: i32,
     pub namespace: String,
     pub timeout_low_ms: u64,
     pub timeout_normal_ms: u64,
@@ -171,7 +169,6 @@ impl Settings {
             .unwrap_or_default();
         Self {
             margin: parsed.margin,
-            gap: parsed.gap.unwrap_or(8).max(0),
             namespace: parsed
                 .namespace
                 .filter(|name| !name.is_empty())

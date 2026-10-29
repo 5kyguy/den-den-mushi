@@ -101,7 +101,9 @@ pub fn expire_ms(
     low_default: u64,
     normal_default: u64,
 ) -> Option<u64> {
-    if resident || requested == 0 {
+    // Critical cards stay until the user or the sender dismisses them,
+    // even when the client asked for a timeout.
+    if urgency == Urgency::Critical || resident || requested == 0 {
         return None;
     }
     if requested > 0 {
@@ -111,6 +113,16 @@ pub fn expire_ms(
         Urgency::Low => Some(low_default),
         Urgency::Normal => Some(normal_default),
         Urgency::Critical => None,
+    }
+}
+
+/// GTK CSS has no `text-transform`, so the app line is uppercased here.
+pub fn display_app(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        "NOTIFY".into()
+    } else {
+        name.to_uppercase()
     }
 }
 
@@ -328,14 +340,21 @@ mod tests {
 
     #[test]
     fn timeouts_follow_the_client_and_urgency() {
-        assert_eq!(
-            expire_ms(1500, Urgency::Critical, false, 4000, 5000),
-            Some(1500)
-        );
+        assert_eq!(expire_ms(1500, Urgency::Critical, false, 4000, 5000), None);
+        assert_eq!(expire_ms(-1, Urgency::Critical, false, 4000, 5000), None);
         assert_eq!(expire_ms(0, Urgency::Normal, false, 4000, 5000), None);
         assert_eq!(expire_ms(-1, Urgency::Normal, true, 4000, 5000), None);
         assert_eq!(expire_ms(-1, Urgency::Low, false, 4000, 5000), Some(4000));
-        assert_eq!(expire_ms(-1, Urgency::Critical, false, 4000, 5000), None);
+        assert_eq!(
+            expire_ms(2500, Urgency::Normal, false, 4000, 5000),
+            Some(2500)
+        );
+    }
+
+    #[test]
+    fn app_line_is_uppercased_in_code() {
+        assert_eq!(display_app("Spotify"), "SPOTIFY");
+        assert_eq!(display_app("  "), "NOTIFY");
     }
 
     #[test]

@@ -28,11 +28,29 @@ window, label, button, button label {
   background-color: @bg;
   border: 1px solid @line;
   border-radius: 8px;
+  transition: background-color 150ms ease-out;
 }
 
 .card:hover,
 .card.hover {
   background-color: @surface;
+}
+
+.card.critical {
+  border-color: @danger;
+}
+
+/* 8px between stacked cards. The layer window does not add its own gap. */
+.toast {
+  margin-bottom: 8px;
+}
+
+.toast:last-child {
+  margin-bottom: 0;
+}
+
+.content {
+  padding: 12px;
 }
 
 .edge {
@@ -55,6 +73,7 @@ window, label, button, button label {
   color: @accent;
   font-size: 11px;
   font-weight: 700;
+  letter-spacing: 0.5px;
 }
 
 .card.critical .glyph,
@@ -71,12 +90,18 @@ window, label, button, button label {
   color: @text;
   font-size: 13px;
   font-weight: 700;
+  margin-top: 4px;
 }
 
 .body {
   color: @muted;
   font-size: 12px;
   font-weight: 400;
+  margin-top: 4px;
+}
+
+.actions {
+  margin-top: 8px;
 }
 
 .time {
@@ -115,6 +140,13 @@ button.close {
   border-radius: 4px;
 }
 
+/* The daemon sets widget opacity to 0 until the pointer is over the card,
+   then to 1 and adds .shown. A CSS opacity rule here stays at 0 in GTK 4.14
+   and would hide the button even while it is hovered. */
+button.close.shown {
+  color: @text;
+}
+
 button.close:hover {
   color: @text;
   background-color: transparent;
@@ -128,6 +160,7 @@ button.action {
   padding: 3px 10px;
   font-size: 11px;
   font-weight: 500;
+  transition: background-color 150ms ease-out;
 }
 
 button.action label {

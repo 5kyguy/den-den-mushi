@@ -63,11 +63,12 @@ notify-send -u critical -a System "Disk failing" "Back up the home volume"
 notify-send -a Venmo -A pay=Pay -A decline=Decline "Gary requested \$40" "for the thing"
 ```
 
-Left click runs the `default` action. Right click, or the ×, dismisses.
-Action buttons invoke their own keys. A thin accent line along the bottom
-tracks the timeout and pauses while the pointer is on the card. Critical
-notifications with no client timeout stay until dismissed. `replaces_id`
-updates the open card.
+Left click runs the `default` action. Right click dismisses. The × stays
+hidden until the pointer is on the card, then it dismisses too. Action
+buttons invoke their own keys. A thin accent line along the bottom tracks
+the timeout and pauses while the pointer is on the card. Critical
+notifications never auto-expire, even if the sender asked for a timeout.
+`replaces_id` updates the open card.
 
 Low-battery notifications (category `device.battery`, or a "low battery"
 summary) use the warning color. Critical uses danger.
@@ -100,18 +101,51 @@ In r2-d2's `config/hypr/autostart.lua`, next to the other session programs:
 hl.exec_cmd("uwsm-app -- den-den-mushi")
 ```
 
-Cards stack in the top-right with 8px between them. The screen inset is half
-of `general:gaps_out` (the same inset the r2-d2 shell uses) plus the
-monitor's reserved top, so a top bar is cleared. Override the inset in
-`~/.config/den-den-mushi/config.toml`:
+Cards anchor to the top-right. The inset from the screen edge is the full
+`general:gaps_out` (the outer gap tiled windows already clear) plus the
+focused monitor's reserved top from `hyprctl monitors -j`, which is the
+bar's exclusive zone. Card padding, the gap between title and body, the
+space above the action row, and the 8px between cards are in
+`contrib/r2-d2/den-den-mushi.css`, not in the binary.
+
+Override the screen inset in `~/.config/den-den-mushi/config.toml`:
 
 ```toml
 margin = 8
-gap = 8
 namespace = "r2-d2-notifications"
 timeout_low_ms = 4000
 timeout_normal_ms = 5000
 ```
+
+r2-d2 already blurs this layer. `config/hypr/looknfeel.lua` uses the current
+`hl.layer_rule` form (the same one the Hyprland wiki documents for layer
+rules), and the namespace matches:
+
+```lua
+hl.layer_rule({
+  match = { namespace = "^(walker|r2-d2-notifications|r2-d2-osd)$" },
+  blur = true,
+  ignore_alpha = 0.1,
+})
+```
+
+`blur` is a boolean and `ignore_alpha` is a float from 0 to 1. The old
+`layerrule = blur, <namespace>` keyword is not the current syntax. On a
+hyprlang config that does not use the lua helper, the equivalent block is:
+
+```
+layerrule {
+    match:namespace = ^(r2-d2-notifications)$
+    blur = on
+    ignore_alpha = 0.1
+}
+```
+
+This was checked against the Hyprland wiki's layer-rule page (the
+`hl.layer_rule` examples) and against r2-d2's `hypr-looknfeel.lua`. It was
+not applied on a running Hyprland: this environment has no Hyprland
+compositor, so `hyprctl` gaps, reserved zones, and blur were not observed
+live. Headless sway has neither Hyprland gaps nor layer rules.
 
 ### systemd --user
 
