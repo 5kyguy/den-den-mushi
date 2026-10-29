@@ -1,0 +1,164 @@
+/* den-den-mushi — r2-d2 theme template.
+   r2-d2-theme-apply fills each colors.ROLE.default.hex marker from the dark
+   palette. The daemon fills any marker that is still present, then recolors
+   these @define-color lines from theme.json when that document is newer
+   than this file. Do not hardcode colors. */
+
+@define-color bg {{colors.bg.default.hex}};
+@define-color surface {{colors.surface.default.hex}};
+@define-color line {{colors.line.default.hex}};
+@define-color accent {{colors.accent.default.hex}};
+@define-color on_accent {{colors.on_accent.default.hex}};
+@define-color text {{colors.text.default.hex}};
+@define-color muted {{colors.muted.default.hex}};
+@define-color danger {{colors.danger.default.hex}};
+@define-color on_danger {{colors.on_danger.default.hex}};
+@define-color warning {{colors.warning.default.hex}};
+@define-color on_warning {{colors.on_warning.default.hex}};
+
+window {
+  background-color: transparent;
+}
+
+window, label, button, button label {
+  font-family: "JetBrainsMono Nerd Font", "JetBrainsMono NF", "JetBrainsMono Nerd Font Mono", "JetBrains Mono", monospace;
+}
+
+.card {
+  background-color: @bg;
+  border: 1px solid @line;
+  border-radius: 8px;
+}
+
+.card:hover,
+.card.hover {
+  background-color: @surface;
+}
+
+.edge {
+  background-color: @accent;
+  min-width: 2px;
+}
+
+.card.critical .edge,
+.card.critical .progress-fill {
+  background-color: @danger;
+}
+
+.card.battery .edge,
+.card.battery .progress-fill {
+  background-color: @warning;
+}
+
+.glyph,
+.app {
+  color: @accent;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.card.critical .glyph,
+.card.critical .app {
+  color: @danger;
+}
+
+.card.battery .glyph,
+.card.battery .app {
+  color: @warning;
+}
+
+.title {
+  color: @text;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.body {
+  color: @muted;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.time {
+  color: @muted;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.progress-track {
+  background-color: transparent;
+  min-height: 2px;
+}
+
+.progress-fill {
+  background-color: @accent;
+  min-height: 2px;
+  border-radius: 0;
+}
+
+button {
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+  border: none;
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+}
+
+button.close {
+  background-color: transparent;
+  color: @muted;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0 2px;
+  border-radius: 4px;
+}
+
+button.close:hover {
+  color: @text;
+  background-color: transparent;
+}
+
+button.action {
+  background-color: @surface;
+  color: @text;
+  border: 1px solid @line;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+button.action label {
+  color: @text;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+button.action:hover {
+  background-color: @accent;
+  border-color: @accent;
+}
+
+button.action:hover label {
+  color: @on_accent;
+}
+
+.card.critical button.action:hover {
+  background-color: @danger;
+  border-color: @danger;
+}
+
+.card.critical button.action:hover label {
+  color: @on_danger;
+}
+
+.card.battery button.action:hover {
+  background-color: @warning;
+  border-color: @warning;
+}
+
+.card.battery button.action:hover label {
+  color: @on_warning;
+}

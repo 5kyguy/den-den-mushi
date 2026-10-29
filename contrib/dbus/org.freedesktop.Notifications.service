@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.freedesktop.Notifications
+# dbus-daemon does not expand systemd's %h. The user unit does.
+Exec=/bin/sh -c 'exec "$HOME/.local/bin/den-den-mushi"'
+SystemdService=den-den-mushi.service

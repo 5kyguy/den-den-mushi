@@ -1,0 +1,17 @@
+[package]
+name = "den-den-mushi"
+version = "0.1.0"
+edition = "2021"
+description = "Freedesktop notification daemon for Hyprland"
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+gtk4 = { version = "0.9.7", features = ["v4_14"] }
+gtk4-layer-shell = "0.5"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+zbus = "4.4"
