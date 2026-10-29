@@ -49,8 +49,19 @@ window, label, button, button label {
   margin-bottom: 0;
 }
 
-.content {
-  padding: 12px;
+/* Margins, not box padding: GTK 4 does not inset GtkBox children for
+   CSS padding, so the title was running into the right edge. Title and
+   body share the same horizontal inset. */
+.header,
+.title,
+.body,
+.actions {
+  margin-left: 12px;
+  margin-right: 12px;
+}
+
+.header {
+  margin-top: 12px;
 }
 
 .edge {
@@ -68,12 +79,23 @@ window, label, button, button label {
   background-color: @warning;
 }
 
-.glyph,
+.glyph {
+  color: @accent;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .app {
   color: @accent;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.5px;
+}
+
+.icon-clip {
+  border-radius: 4px;
+  min-width: 11px;
+  min-height: 11px;
 }
 
 .card.critical .glyph,
@@ -98,10 +120,14 @@ window, label, button, button label {
   font-size: 12px;
   font-weight: 400;
   margin-top: 4px;
+  margin-bottom: 12px;
 }
 
 .actions {
-  margin-top: 8px;
+  /* Body already has 12px below it. Pull up so the gap above the
+     buttons stays 8px, then keep 12px under the row. */
+  margin-top: -4px;
+  margin-bottom: 12px;
 }
 
 .time {
@@ -113,6 +139,8 @@ window, label, button, button label {
 .progress-track {
   background-color: transparent;
   min-height: 2px;
+  /* Inner radius: 8px card radius minus the 1px border. */
+  border-radius: 0 0 7px 7px;
 }
 
 .progress-fill {

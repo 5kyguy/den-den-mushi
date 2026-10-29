@@ -4,7 +4,9 @@
 use gtk4 as gtk;
 
 use crate::gaps::{self, Insets};
-use crate::model::{display_app, IconSource, Note, REASON_DISMISSED, REASON_EXPIRED};
+use crate::model::{
+    display_app, relative_time, IconSource, Note, REASON_DISMISSED, REASON_EXPIRED,
+};
 use crate::server::{UiCommand, UiEvent};
 use crate::theme::{self, Settings};
 use gtk::gdk::MemoryFormat;
@@ -24,6 +26,8 @@ const SLIDE_OUT: Duration = Duration::from_millis(120);
 const SLIDE_DISTANCE: f64 = 96.0;
 const CARD_WIDTH: i32 = 380;
 const MAX_CARDS: usize = 8;
+/// Matches `.glyph` font-size in the theme stylesheet.
+const GLYPH_PX: i32 = 11;
 
 pub fn run(
     settings: Settings,
@@ -92,8 +96,11 @@ struct LiveCard {
     app: gtk::Label,
     title: gtk::Label,
     body: gtk::Label,
+    time: gtk::Label,
     actions: gtk::Box,
     progress: gtk::Box,
+    progress_track: gtk::Box,
+    created_unix: i64,
     close: gtk::Button,
     icon_slot: gtk::Box,
     expire_ms: Option<u64>,
@@ -226,6 +233,7 @@ impl Shell {
         for card in &mut self.cards {
             step_motion(card);
             update_hover(card);
+            update_relative_time(card);
             if !card.leaving && !card.paused.get() {
                 if let Some(total) = card.expire_ms {
                     card.remaining_ms = (card.remaining_ms - 16.0).max(0.0);
@@ -234,7 +242,10 @@ impl Shell {
                     } else {
                         (card.remaining_ms / total as f64).clamp(0.0, 1.0)
                     };
-                    let width = ((CARD_WIDTH as f64) * fraction).round() as i32;
+                    // Use the track's real width so a full bar reaches both
+                    // rounded corners instead of a fixed card constant.
+                    let track = card.progress_track.width().max(1);
+                    let width = ((track as f64) * fraction).round() as i32;
                     card.progress.set_size_request(width.max(0), 2);
                     if card.remaining_ms <= 0.0 {
                         finished.push(card.id);
@@ -400,8 +411,10 @@ fn refresh_card(card: &mut LiveCard, note: &Note) {
     card.body.set_visible(!note.body.is_empty());
     card.expire_ms = note.expire_ms;
     card.remaining_ms = note.expire_ms.unwrap_or(0) as f64;
-    card.progress.set_visible(note.expire_ms.is_some());
-    card.progress.set_size_request(CARD_WIDTH, 2);
+    card.created_unix = note.created_unix;
+    card.time
+        .set_text(&relative_time(note.created_unix, unix_now()));
+    card.progress_track.set_visible(note.expire_ms.is_some());
     card.has_default.set(note.has_default);
     card.root.remove_css_class("critical");
     card.root.remove_css_class("battery");
@@ -440,20 +453,31 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     content.set_hexpand(true);
 
     let header = gtk::Box::new(Orientation::Horizontal, 6);
+    header.add_css_class("header");
     let icon_slot = gtk::Box::new(Orientation::Horizontal, 0);
     icon_slot.set_valign(Align::Center);
     refill_icon(&icon_slot, note);
 
+    // Natural width, and ellipsize only when the row is actually out of
+    // room. Start-align plus ellipsize made GTK use the ellipsis as the
+    // width, so "SPOTIFY" drew as "SPOTIF…".
     let app = gtk::Label::new(Some(&display_app(&note.app_name)));
     app.add_css_class("app");
     app.set_halign(Align::Start);
-    app.set_hexpand(true);
-    app.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    app.set_hexpand(false);
     app.set_xalign(0.0);
+    // No ellipsize here. With ellipsize on, GTK sizes the label to the
+    // ellipsis and "SPOTIFY" draws as "SPOTIF…". The clock is the hexpand
+    // child, so it shrinks first if the row actually runs out of room.
 
-    let time = gtk::Label::new(Some(&format_time(note.created_unix)));
+    let time = gtk::Label::new(Some(&relative_time(note.created_unix, unix_now())));
     time.add_css_class("time");
     time.set_valign(Align::Center);
+    // The clock takes the spare width and is the first thing to shrink.
+    time.set_hexpand(true);
+    time.set_halign(Align::Fill);
+    time.set_xalign(1.0);
+    time.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
     let close = gtk::Button::with_label("×");
     close.add_css_class("close");
@@ -507,10 +531,15 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
 
     let progress_track = gtk::Box::new(Orientation::Horizontal, 0);
     progress_track.add_css_class("progress-track");
+    progress_track.set_hexpand(true);
+    // Clip the bar to the card's bottom radius. Overflow on the card alone
+    // was leaving a square end short of the corner.
+    progress_track.set_overflow(Overflow::Hidden);
     let progress = gtk::Box::new(Orientation::Horizontal, 0);
     progress.add_css_class("progress-fill");
-    progress.set_size_request(CARD_WIDTH, 2);
+    progress.set_hexpand(false);
     progress.set_halign(Align::Start);
+    progress.set_vexpand(false);
     progress_track.append(&progress);
     progress_track.set_visible(note.expire_ms.is_some());
 
@@ -569,8 +598,11 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
         app,
         title,
         body,
+        time,
         actions,
         progress,
+        progress_track,
+        created_unix: note.created_unix,
         close,
         icon_slot,
         expire_ms: note.expire_ms,
@@ -661,11 +693,15 @@ fn pointer_over(widget: &impl IsA<gtk::Widget>) -> bool {
     point.x() >= 0.0 && point.y() >= 0.0 && point.x() < width && point.y() < height
 }
 
-fn format_time(unix: i64) -> String {
-    glib::DateTime::from_unix_local(unix)
-        .and_then(|date| date.format("%a %l:%M %p"))
-        .map(|text| text.replace("  ", " "))
-        .unwrap_or_default()
+fn unix_now() -> i64 {
+    glib::real_time() / 1_000_000
+}
+
+fn update_relative_time(card: &LiveCard) {
+    let next = relative_time(card.created_unix, unix_now());
+    if card.time.text().as_str() != next {
+        card.time.set_text(&next);
+    }
 }
 
 fn set_body(label: &gtk::Label, body: &str) {
@@ -687,15 +723,9 @@ fn refill_icon(slot: &gtk::Box, note: &Note) {
             height,
             rgba,
         } => texture_image(width, height, rgba),
-        IconSource::File(path) => {
-            let image = gtk::Image::from_file(path);
-            image.set_pixel_size(16);
-            image.upcast()
-        }
+        IconSource::File(path) => rounded_icon(gtk::Image::from_file(path)),
         IconSource::IconName(name) if icon_exists(name) => {
-            let image = gtk::Image::from_icon_name(name);
-            image.set_pixel_size(16);
-            image.upcast()
+            rounded_icon(gtk::Image::from_icon_name(name))
         }
         IconSource::IconName(_) | IconSource::Glyph(_) => glyph_widget(&note.glyph_fallback),
     };
@@ -711,9 +741,19 @@ fn texture_image(width: &i32, height: &i32, rgba: &[u8]) -> gtk::Widget {
         &bytes,
         (*width * 4) as usize,
     );
-    let image = gtk::Image::from_paintable(Some(&texture));
-    image.set_pixel_size(16);
-    image.upcast()
+    rounded_icon(gtk::Image::from_paintable(Some(&texture)))
+}
+
+fn rounded_icon(image: gtk::Image) -> gtk::Widget {
+    image.set_pixel_size(GLYPH_PX);
+    image.add_css_class("app-icon");
+    let clip = gtk::Box::new(Orientation::Horizontal, 0);
+    clip.add_css_class("icon-clip");
+    clip.set_overflow(Overflow::Hidden);
+    clip.set_size_request(GLYPH_PX, GLYPH_PX);
+    clip.set_valign(Align::Center);
+    clip.append(&image);
+    clip.upcast()
 }
 
 fn glyph_widget(text: &str) -> gtk::Widget {

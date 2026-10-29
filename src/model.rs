@@ -116,6 +116,21 @@ pub fn expire_ms(
     }
 }
 
+/// Relative age shown on a card. Under a minute stays "now"; after that
+/// the unit steps through minutes, hours, and days.
+pub fn relative_time(created_unix: i64, now_unix: i64) -> String {
+    let elapsed = (now_unix - created_unix).max(0);
+    if elapsed < 60 {
+        "now".to_string()
+    } else if elapsed < 60 * 60 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 60 * 60 * 24 {
+        format!("{}h", elapsed / 3600)
+    } else {
+        format!("{}d", elapsed / 86400)
+    }
+}
+
 /// GTK CSS has no `text-transform`, so the app line is uppercased here.
 pub fn display_app(name: &str) -> String {
     let name = name.trim();
@@ -355,6 +370,18 @@ mod tests {
     fn app_line_is_uppercased_in_code() {
         assert_eq!(display_app("Spotify"), "SPOTIFY");
         assert_eq!(display_app("  "), "NOTIFY");
+    }
+
+    #[test]
+    fn relative_time_steps_through_units() {
+        let start = 1_700_000_000;
+        assert_eq!(relative_time(start, start), "now");
+        assert_eq!(relative_time(start, start + 59), "now");
+        assert_eq!(relative_time(start, start + 60), "1m");
+        assert_eq!(relative_time(start, start + 120), "2m");
+        assert_eq!(relative_time(start, start + 3600), "1h");
+        assert_eq!(relative_time(start, start + 86_400), "1d");
+        assert_eq!(relative_time(start + 10, start), "now");
     }
 
     #[test]
