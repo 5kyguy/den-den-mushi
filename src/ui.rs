@@ -97,6 +97,7 @@ struct LiveCard {
     title: gtk::Label,
     body: gtk::Label,
     time: gtk::Label,
+    corner: gtk::Stack,
     actions: gtk::Box,
     progress: gtk::Box,
     progress_track: gtk::Box,
@@ -473,20 +474,15 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     let time = gtk::Label::new(Some(&relative_time(note.created_unix, unix_now())));
     time.add_css_class("time");
     time.set_valign(Align::Center);
-    // The clock takes the spare width and is the first thing to shrink.
-    time.set_hexpand(true);
-    time.set_halign(Align::Fill);
+    time.set_halign(Align::End);
     time.set_xalign(1.0);
-    time.set_ellipsize(gtk::pango::EllipsizeMode::End);
 
     let close = gtk::Button::with_label("×");
     close.add_css_class("close");
     close.set_valign(Align::Center);
-    // Hidden until the pointer is over the card. GTK 4.14 does not let a
-    // later CSS opacity rule override `button.close { opacity: 0 }`, so the
-    // daemon sets the widget opacity directly. can_target stays off so the
-    // invisible button cannot take the click.
-    close.set_opacity(0.0);
+    close.set_halign(Align::End);
+    // The button is not the visible stack child until hover, so it must
+    // not take clicks while the time is showing.
     close.set_can_target(false);
     let commands_close = commands.clone();
     let close_id = note.id;
@@ -497,10 +493,28 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
         });
     });
 
+    // One slot at the right inset. Idle shows the time flush with that
+    // inset; hover crossfades to the ×. A hidden button beside the time
+    // left a hollow gap.
+    let corner = gtk::Stack::new();
+    corner.add_css_class("corner");
+    corner.set_transition_type(gtk::StackTransitionType::Crossfade);
+    corner.set_transition_duration(150);
+    corner.set_hhomogeneous(false);
+    corner.set_vhomogeneous(false);
+    corner.set_interpolate_size(true);
+    corner.set_halign(Align::End);
+    corner.set_valign(Align::Center);
+    corner.add_named(&time, Some("time"));
+    corner.add_named(&close, Some("close"));
+    corner.set_visible_child_name("time");
+
+    let spacer = gtk::Box::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
     header.append(&icon_slot);
     header.append(&app);
-    header.append(&time);
-    header.append(&close);
+    header.append(&spacer);
+    header.append(&corner);
 
     let title = gtk::Label::new(Some(&note.summary));
     title.add_css_class("title");
@@ -599,6 +613,7 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
         title,
         body,
         time,
+        corner,
         actions,
         progress,
         progress_track,
@@ -645,16 +660,18 @@ fn clamp_lines(label: &gtk::Label, lines: i32) {
 
 fn update_hover(card: &LiveCard) {
     let over = pointer_over(&card.root);
-    if over {
-        card.root.add_css_class("hover");
-        card.close.add_css_class("shown");
-        card.close.set_opacity(1.0);
-        card.close.set_can_target(true);
-    } else {
-        card.root.remove_css_class("hover");
-        card.close.remove_css_class("shown");
-        card.close.set_opacity(0.0);
-        card.close.set_can_target(false);
+    if over != card.paused.get() {
+        if over {
+            card.root.add_css_class("hover");
+            card.close.add_css_class("shown");
+            card.close.set_can_target(true);
+            card.corner.set_visible_child_name("close");
+        } else {
+            card.root.remove_css_class("hover");
+            card.close.remove_css_class("shown");
+            card.close.set_can_target(false);
+            card.corner.set_visible_child_name("time");
+        }
     }
     card.paused.set(over);
 }
