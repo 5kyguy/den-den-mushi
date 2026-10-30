@@ -1,0 +1,31 @@
+# Maintainer: 5kyguy <0x5kyguy@gmail.com>
+pkgname=den-den-mushi
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Freedesktop notification daemon for Hyprland'
+arch=(x86_64)
+url='https://github.com/5kyguy/den-den-mushi'
+license=(MIT)
+depends=(gtk4 gtk4-layer-shell)
+makedepends=(cargo git)
+optdepends=('ttf-jetbrains-mono-nerd: icon glyphs on cards and the panel')
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+prepare() {
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu" --manifest-path "$srcdir/$pkgname/Cargo.toml"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --frozen --release --manifest-path "$srcdir/$pkgname/Cargo.toml"
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/den-den-mushi" -t "$pkgdir/usr/bin/"
+  install -Dm644 "$srcdir/$pkgname/packaging/den-den-mushi.service" -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 "$srcdir/$pkgname/LICENSE" -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 "$srcdir/$pkgname/README.md" -t "$pkgdir/usr/share/doc/$pkgname/"
+}

@@ -1,0 +1,16 @@
+pkgbase = den-den-mushi
+	pkgdesc = Freedesktop notification daemon for Hyprland
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/5kyguy/den-den-mushi
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = gtk4
+	depends = gtk4-layer-shell
+	optdepends = ttf-jetbrains-mono-nerd: icon glyphs on cards and the panel
+	source = den-den-mushi::git+https://github.com/5kyguy/den-den-mushi.git#tag=v0.1.0
+	sha256sums = SKIP
+
+pkgname = den-den-mushi
