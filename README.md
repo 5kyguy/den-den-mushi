@@ -30,18 +30,42 @@ r2-d2 already matches.
 
 ## Releases
 
-On Arch, install from the AUR:
+Install the latest release (Linux, x86_64):
 
 ```bash
-yay -S den-den-mushi          # or paru
-systemctl --user enable --now den-den-mushi.service
+curl -fsSL https://raw.githubusercontent.com/5kyguy/den-den-mushi/main/scripts/install.sh | bash
 ```
 
-The package installs the binary to `/usr/bin/`, the packaged user unit to
-`/usr/lib/systemd/user/` (not enabled by default), the license, and the
-README. It deliberately does not install
+The script downloads the release tarball, verifies it against the release
+`SHA256SUMS`, installs the binary to `~/.local/bin` and the user unit to
+`~/.config/systemd/user/`, and restarts the daemon if it was running.
+Neither the script nor the package below installs
 `contrib/dbus/org.freedesktop.Notifications.service` — D-Bus activation
 would fight any other notification server claiming the name.
+
+```bash
+# start it (first install)
+systemctl --user enable --now den-den-mushi.service
+# update / uninstall
+curl -fsSL https://raw.githubusercontent.com/5kyguy/den-den-mushi/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/5kyguy/den-den-mushi/main/scripts/install.sh | bash -s -- --uninstall
+```
+
+Updating re-runs the installer; uninstalling keeps the history, rules, and
+config. `DDM_BIN_DIR` and `DDM_UNIT_DIR` install elsewhere.
+
+On Arch, `packaging/` builds a pacman package instead — binary in
+`/usr/bin/`, the packaged unit in `/usr/lib/systemd/user/` (not enabled by
+default), license, and README:
+
+```bash
+git clone https://github.com/5kyguy/den-den-mushi
+cd den-den-mushi/packaging && makepkg -si
+```
+
+The package will be published to the AUR as `den-den-mushi` once account
+registration reopens; until then the PKGBUILD ships in the repo and as a
+release asset.
 
 Releases are tagged `vX.Y.Z`, the version from `Cargo.toml`, and carry a
 prebuilt binary tarball, the `PKGBUILD`, and `SHA256SUMS` on GitHub. Cutting
@@ -53,8 +77,8 @@ scripts/aur-publish.sh    # pushes packaging/PKGBUILD + .SRCINFO to the AUR
 ```
 
 `aur-publish` needs an AUR account with the SSH key registered. Nothing in
-this repo touches a running desktop; users update through the release, the
-AUR package, or the manual build below.
+this repo touches a running desktop; users update through the installer,
+the package, or the manual build below.
 
 ## Build
 
