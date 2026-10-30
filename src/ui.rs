@@ -1,5 +1,6 @@
-//! Layer-shell window. Cards stack in the top-right, slide in from the
-//! right, and fade out on the way back.
+//! Layer-shell window. Cards stack in the top-right. Enter slides in from
+//! +24px, exit slides back out, and a leaving card lets the ones below
+//! spring upward. A replace crossfades the face in place.
 
 use gtk4 as gtk;
 
@@ -7,6 +8,7 @@ use crate::gaps::{self, Insets};
 use crate::model::{
     display_app, relative_time, IconSource, Note, REASON_DISMISSED, REASON_EXPIRED,
 };
+use crate::motion::{self, YTrack};
 use crate::panel_ui::{self, Panel};
 use crate::server::{UiCommand, UiEvent};
 use crate::theme::{self, Settings};
@@ -17,14 +19,11 @@ use gtk::subclass::prelude::*;
 use gtk::{gdk, graphene, Align, Orientation, Overflow};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-const SLIDE_IN: Duration = Duration::from_millis(180);
-const SLIDE_OUT: Duration = Duration::from_millis(120);
-const SLIDE_DISTANCE: f64 = 96.0;
 const CARD_WIDTH: i32 = 380;
 const MAX_CARDS: usize = 8;
 /// Matches `.glyph` font-size in the theme stylesheet.
@@ -65,6 +64,7 @@ pub fn run(
             panel_calls,
         );
         let shell = Rc::new(RefCell::new(shell));
+        shell.borrow_mut().self_weak = Rc::downgrade(&shell);
         let events = Rc::new(RefCell::new(events));
         let shell_for_tick = Rc::clone(&shell);
         let events_for_tick = Rc::clone(&events);
@@ -119,6 +119,9 @@ struct LiveCard {
     paused: Rc<Cell<bool>>,
     leaving: bool,
     motion: Motion,
+    track: YTrack,
+    fade: CrossfadeBin,
+    crossfade_start: Option<Instant>,
     has_default: Rc<Cell<bool>>,
     commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
 }
@@ -131,8 +134,12 @@ struct Motion {
 
 struct Shell {
     window: gtk::ApplicationWindow,
-    column: gtk::Box,
+    column: ToastColumn,
     cards: Vec<LiveCard>,
+    self_weak: Weak<RefCell<Shell>>,
+    frame_armed: bool,
+    last_integrate: Instant,
+    last_frame_us: i64,
     provider: gtk::CssProvider,
     settings: Settings,
     dnd: std::sync::Arc<AtomicBool>,
@@ -179,11 +186,15 @@ impl Shell {
             eprintln!("den-den-mushi: layer shell is unavailable; using an ordinary window");
         }
 
-        // The 8px stack gap is `.toast { margin-bottom: 8px }` in the stylesheet.
-        let column = gtk::Box::new(Orientation::Vertical, 0);
+        // The 8px stack gap is applied while laying cards out. It matches
+        // `.toast { margin-bottom: 8px }` in the stylesheet.
+        let column = ToastColumn::new();
         column.set_halign(Align::End);
         column.set_valign(Align::Start);
         window.set_child(Some(&column));
+        if !settings.motion {
+            eprintln!("den-den-mushi: motion off");
+        }
 
         let theme = theme::load_theme();
         eprintln!("den-den-mushi: theme {}", theme.source);
@@ -206,6 +217,10 @@ impl Shell {
             window,
             column,
             cards: Vec::new(),
+            self_weak: Weak::new(),
+            frame_armed: false,
+            last_integrate: Instant::now(),
+            last_frame_us: 0,
             provider,
             settings,
             dnd,
@@ -252,7 +267,6 @@ impl Shell {
 
         let mut finished = Vec::new();
         for card in &mut self.cards {
-            step_motion(card);
             update_hover(card);
             update_relative_time(card);
             if !card.leaving && !card.paused.get() {
@@ -277,24 +291,156 @@ impl Shell {
         for id in finished {
             self.user_close(id, REASON_EXPIRED);
         }
-        self.cards.retain(|card| {
-            let done = card.leaving && card.motion.start.elapsed() >= card.motion.duration;
-            if done {
-                self.column.remove(&card.slide);
-            }
-            !done
-        });
+        // The frame clock integrates the spring. This 16ms tick is the
+        // fallback when that clock has not run, and it still owns expiry.
+        if self.cards_need_frames() && self.last_integrate.elapsed() >= Duration::from_millis(30) {
+            let dt = motion::animation_dt(self.last_integrate.elapsed().as_secs_f64());
+            self.integrate(dt);
+        }
+        if self.cards_need_frames() {
+            self.arm_frame();
+        }
+        self.sync_input_region();
         self.sync_window();
         self.panel.tick();
     }
 
-    fn upsert(&mut self, note: Note) {
-        if let Some(card) = self
+    fn on_frame(&mut self, clock: &gdk::FrameClock) -> bool {
+        let now = clock.frame_time();
+        let dt = if self.last_frame_us == 0 || now <= self.last_frame_us {
+            motion::animation_dt(self.last_integrate.elapsed().as_secs_f64())
+        } else {
+            let secs = (now - self.last_frame_us) as f64 / 1_000_000.0;
+            motion::animation_dt(secs)
+        };
+        self.last_frame_us = now;
+        self.integrate(dt);
+        let keep = self.cards_need_frames();
+        if !keep {
+            self.frame_armed = false;
+        }
+        self.sync_input_region();
+        keep
+    }
+
+    fn arm_frame(&mut self) {
+        if self.frame_armed {
+            return;
+        }
+        self.frame_armed = true;
+        let weak = self.self_weak.clone();
+        self.window.add_tick_callback(move |_widget, clock| {
+            let Some(shell) = weak.upgrade() else {
+                return ControlFlow::Break;
+            };
+            if shell.borrow_mut().on_frame(clock) {
+                ControlFlow::Continue
+            } else {
+                ControlFlow::Break
+            }
+        });
+    }
+
+    fn integrate(&mut self, dt: f64) {
+        if dt <= 0.0 {
+            return;
+        }
+        self.last_integrate = Instant::now();
+        let enabled = self.settings.motion;
+        self.retarget();
+        for card in &mut self.cards {
+            if enabled {
+                card.track.spring.step(dt);
+                if card.track.spring.resting() {
+                    card.track.spring.snap();
+                }
+            } else {
+                card.track.spring.snap();
+            }
+            card.slide.set_layout_y(card.track.spring.position);
+            step_slide(card);
+            step_crossfade(card);
+        }
+        let column = self.column.clone();
+        self.cards.retain(|card| {
+            let done = card.leaving
+                && motion::unit_progress(card.motion.start.elapsed(), card.motion.duration) >= 1.0;
+            if done {
+                column.remove_card(&card.slide);
+            }
+            !done
+        });
+        self.retarget();
+        for card in &mut self.cards {
+            if !enabled {
+                card.track.spring.snap();
+            }
+            card.slide.set_layout_y(card.track.spring.position);
+        }
+        self.column.queue_resize();
+        self.sync_window();
+    }
+
+    fn cards_need_frames(&self) -> bool {
+        self.cards.iter().any(|card| {
+            let sliding =
+                motion::unit_progress(card.motion.start.elapsed(), card.motion.duration) < 1.0;
+            let fading = card.crossfade_start.is_some_and(|start| {
+                motion::unit_progress(start.elapsed(), motion::crossfade_duration(true)) < 1.0
+            });
+            sliding
+                || fading
+                || card.leaving
+                || !card.track.spring.resting()
+                || !card.track.anchored
+        })
+    }
+
+    fn retarget(&mut self) {
+        let heights: Vec<f64> = self.cards.iter().map(card_height).collect();
+        let elapsed: Vec<Duration> = self
             .cards
-            .iter_mut()
-            .find(|card| card.id == note.id && !card.leaving)
+            .iter()
+            .map(|card| card.motion.start.elapsed())
+            .collect();
+        let leaving: Vec<bool> = self
+            .cards
+            .iter()
+            .zip(&elapsed)
+            .map(|(card, elapsed)| {
+                card.leaving && !motion::holds_stack_slot(true, *elapsed, self.settings.motion)
+            })
+            .collect();
+        let any_leaving = self.cards.iter().any(|card| card.leaving);
+        let targets = motion::restack_targets(&heights, &leaving, motion::STACK_GAP);
+        for (card, target) in self.cards.iter_mut().zip(targets) {
+            if card.leaving {
+                continue;
+            }
+            if let Some(y) = target {
+                // Motion off snaps inside `follow` because `any_leaving` is
+                // ignored, and `integrate` snaps the spring on top of that.
+                card.track.follow(y, any_leaving && self.settings.motion);
+            }
+        }
+    }
+
+    fn upsert(&mut self, note: Note) {
+        if let Some(index) = self
+            .cards
+            .iter()
+            .position(|card| card.id == note.id && !card.leaving)
         {
-            refresh_card(card, &note);
+            if self.settings.motion {
+                self.cards[index].begin_replace(&note);
+                self.arm_frame();
+            } else {
+                refresh_card(&mut self.cards[index], &note);
+            }
+            self.retarget();
+            self.place_cards();
+            self.column.queue_resize();
+            self.sync_input_region();
             return;
         }
         while self.cards.iter().filter(|card| !card.leaving).count() >= MAX_CARDS {
@@ -309,25 +455,75 @@ impl Shell {
                 break;
             }
         }
-        let card = build_card(&note, self.commands.clone());
-        self.column.append(&card.slide);
+        let card = build_card(&note, self.commands.clone(), self.settings.motion);
+        self.column.add_card(&card.slide);
         self.cards.push(card);
+        self.retarget();
+        self.place_cards();
+        self.column.queue_resize();
         self.sync_window();
+        self.arm_frame();
+    }
+
+    fn place_cards(&self) {
+        for card in &self.cards {
+            card.slide.set_layout_y(card.track.spring.position);
+        }
     }
 
     fn begin_leave(&mut self, id: u32) {
-        if let Some(card) = self
+        let Some(index) = self
             .cards
-            .iter_mut()
-            .find(|card| card.id == id && !card.leaving)
+            .iter()
+            .position(|card| card.id == id && !card.leaving)
+        else {
+            return;
+        };
         {
+            let card = &mut self.cards[index];
             card.leaving = true;
+            card.track.spring.target = card.track.spring.position;
+            card.track.spring.velocity = 0.0;
             card.motion = Motion {
                 start: Instant::now(),
-                duration: SLIDE_OUT,
+                duration: motion::exit_duration(self.settings.motion),
                 leaving: true,
             };
+            // Draw the leaving card above the ones that spring up into its slot.
+            let slide = card.slide.clone();
+            self.column.remove_card(&slide);
+            self.column.add_card(&slide);
         }
+        self.retarget();
+        self.place_cards();
+        self.arm_frame();
+    }
+
+    fn sync_input_region(&self) {
+        let Some(surface) = self.window.surface() else {
+            return;
+        };
+        let scale = surface.scale_factor();
+        let region = cairo::Region::create();
+        let root = self.window.upcast_ref::<gtk::Widget>();
+        for card in &self.cards {
+            let Some(bounds) = card.slide.compute_bounds(root) else {
+                continue;
+            };
+            let Some((x, y, width, height)) = motion::visible_input_rect(
+                f64::from(bounds.x()),
+                f64::from(bounds.y()),
+                f64::from(bounds.width()),
+                f64::from(bounds.height()),
+                card.slide.offset(),
+                card.slide.opacity(),
+                scale,
+            ) else {
+                continue;
+            };
+            let _ = region.union_rectangle(&cairo::RectangleInt::new(x, y, width, height));
+        }
+        surface.set_input_region(&region);
     }
 
     fn user_close(&mut self, id: u32, reason: u32) {
@@ -411,17 +607,34 @@ fn load_css(provider: &gtk::CssProvider, css: &str) {
     provider.load_from_string(css);
 }
 
-fn step_motion(card: &mut LiveCard) {
-    let elapsed = card.motion.start.elapsed().as_secs_f64();
-    let duration = card.motion.duration.as_secs_f64().max(0.001);
-    let t = (elapsed / duration).clamp(0.0, 1.0);
-    let eased = 1.0 - (1.0 - t).powi(3);
+fn step_slide(card: &mut LiveCard) {
+    let t = motion::unit_progress(card.motion.start.elapsed(), card.motion.duration);
     if card.motion.leaving {
-        card.slide.set_offset(SLIDE_DISTANCE * eased);
-        card.slide.set_opacity(1.0 - eased);
+        card.slide.set_offset(motion::exit_offset(t));
+        card.slide.set_opacity(motion::exit_opacity(t));
     } else {
-        card.slide.set_offset(SLIDE_DISTANCE * (1.0 - eased));
-        card.slide.set_opacity(eased);
+        card.slide.set_offset(motion::enter_offset(t));
+        card.slide.set_opacity(motion::enter_opacity(t));
+    }
+}
+
+fn step_crossfade(card: &mut LiveCard) {
+    let Some(start) = card.crossfade_start else {
+        return;
+    };
+    let t = motion::unit_progress(start.elapsed(), motion::crossfade_duration(true));
+    card.fade.set_blend(motion::crossfade_blend(t));
+    if t >= 1.0 {
+        card.crossfade_start = None;
+    }
+}
+
+fn card_height(card: &LiveCard) -> f64 {
+    let (_, natural, _, _) = card.slide.measure(Orientation::Vertical, CARD_WIDTH);
+    if natural > 0 {
+        f64::from(natural)
+    } else {
+        f64::from(card.slide.height().max(1))
     }
 }
 
@@ -453,7 +666,58 @@ fn refresh_card(card: &mut LiveCard, note: &Note) {
     });
 }
 
-fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiCommand>) -> LiveCard {
+fn build_card(
+    note: &Note,
+    commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    motion_enabled: bool,
+) -> LiveCard {
+    let body = build_body(note, commands.clone());
+    let fade = CrossfadeBin::new();
+    fade.set_current(body.root.upcast_ref());
+    let slide = SlideBin::new();
+    slide.add_css_class("toast");
+    slide.set_overflow(Overflow::Hidden);
+    slide.set_child(Some(fade.upcast_ref()));
+    if motion_enabled {
+        slide.set_offset(motion::SLIDE_PX);
+        slide.set_opacity(0.0);
+    } else {
+        slide.set_offset(0.0);
+        slide.set_opacity(1.0);
+    }
+    LiveCard {
+        id: note.id,
+        slide,
+        root: body.root,
+        app: body.app,
+        title: body.title,
+        body: body.body,
+        time: body.time,
+        corner: body.corner,
+        actions: body.actions,
+        progress: body.progress,
+        progress_track: body.progress_track,
+        created_unix: note.created_unix,
+        close: body.close,
+        icon_slot: body.icon_slot,
+        expire_ms: note.expire_ms,
+        remaining_ms: note.expire_ms.unwrap_or(0) as f64,
+        paused: body.paused,
+        leaving: false,
+        motion: Motion {
+            start: Instant::now(),
+            duration: motion::enter_duration(motion_enabled),
+            leaving: false,
+        },
+        track: YTrack::new(),
+        fade,
+        crossfade_start: None,
+        has_default: body.has_default,
+        commands,
+    }
+}
+
+fn build_body(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiCommand>) -> CardBody {
     let root = gtk::Box::new(Orientation::Vertical, 0);
     root.add_css_class("card");
     root.set_size_request(CARD_WIDTH, -1);
@@ -581,13 +845,6 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     root.append(&row);
     root.append(&progress_track);
 
-    let slide = SlideBin::new();
-    slide.add_css_class("toast");
-    slide.set_overflow(Overflow::Hidden);
-    slide.set_child(Some(root.upcast_ref()));
-    slide.set_offset(SLIDE_DISTANCE);
-    slide.set_opacity(0.0);
-
     let paused = Rc::new(Cell::new(false));
 
     let click = gtk::GestureClick::new();
@@ -628,9 +885,7 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     });
     root.add_controller(right);
 
-    LiveCard {
-        id: note.id,
-        slide,
+    CardBody {
         root,
         app,
         title,
@@ -640,21 +895,55 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
         actions,
         progress,
         progress_track,
-        created_unix: note.created_unix,
         close,
         icon_slot,
-        expire_ms: note.expire_ms,
-        remaining_ms: note.expire_ms.unwrap_or(0) as f64,
         paused,
-        leaving: false,
-        motion: Motion {
-            start: Instant::now(),
-            duration: SLIDE_IN,
-            leaving: false,
-        },
         has_default,
-        commands,
     }
+}
+
+impl LiveCard {
+    /// `replaces_id` and a stack tag both land here: the slot stays put and
+    /// the face crossfades. The outer height stays at the current card so
+    /// neighbors do not move during the 120ms.
+    fn begin_replace(&mut self, note: &Note) {
+        let body = build_body(note, self.commands.clone());
+        let old_height = self.slide.height();
+        self.fade.start(body.root.upcast_ref(), old_height);
+        self.crossfade_start = Some(Instant::now());
+        self.root = body.root;
+        self.app = body.app;
+        self.title = body.title;
+        self.body = body.body;
+        self.time = body.time;
+        self.corner = body.corner;
+        self.actions = body.actions;
+        self.progress = body.progress;
+        self.progress_track = body.progress_track;
+        self.close = body.close;
+        self.icon_slot = body.icon_slot;
+        self.paused = body.paused;
+        self.has_default = body.has_default;
+        self.expire_ms = note.expire_ms;
+        self.remaining_ms = note.expire_ms.unwrap_or(0) as f64;
+        self.created_unix = note.created_unix;
+    }
+}
+
+struct CardBody {
+    root: gtk::Box,
+    app: gtk::Label,
+    title: gtk::Label,
+    body: gtk::Label,
+    time: gtk::Label,
+    corner: gtk::Stack,
+    actions: gtk::Box,
+    progress: gtk::Box,
+    progress_track: gtk::Box,
+    close: gtk::Button,
+    icon_slot: gtk::Box,
+    paused: Rc<Cell<bool>>,
+    has_default: Rc<Cell<bool>>,
 }
 
 pub(crate) fn is_button(widget: &gtk::Widget) -> bool {
@@ -829,6 +1118,7 @@ mod slide {
     #[derive(Default)]
     pub struct SlideBin {
         pub(super) offset: Cell<f64>,
+        pub(super) layout_y: Cell<f64>,
         pub(super) child: RefCell<Option<gtk::Widget>>,
     }
 
@@ -855,6 +1145,18 @@ mod slide {
     }
 
     impl WidgetImpl for SlideBin {
+        fn contains(&self, x: f64, y: f64) -> bool {
+            let widget = self.obj();
+            let width = f64::from(widget.width());
+            let height = f64::from(widget.height());
+            if widget.opacity() <= 0.01 || x < 0.0 || y < 0.0 || x >= width || y >= height {
+                return false;
+            }
+            // The face is translated right by `offset` and clipped, so the
+            // uncovered strip at the left is not part of the card.
+            x >= self.offset.get()
+        }
+
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let offset = self.offset.get() as f32;
             if offset != 0.0 {
@@ -901,10 +1203,270 @@ impl SlideBin {
     pub(crate) fn offset(&self) -> f64 {
         self.imp().offset.get()
     }
+
+    pub(crate) fn set_layout_y(&self, y: f64) {
+        self.imp().layout_y.set(y);
+    }
+
+    pub(crate) fn layout_y(&self) -> f64 {
+        self.imp().layout_y.get()
+    }
 }
 
 impl Default for SlideBin {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+mod column {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct ToastColumn;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for ToastColumn {
+        const NAME: &'static str = "DenDenToastColumn";
+        type Type = super::ToastColumn;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for ToastColumn {
+        fn dispose(&self) {
+            let obj = self.obj();
+            while let Some(child) = obj.first_child() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for ToastColumn {
+        fn measure(&self, orientation: Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            if orientation == Orientation::Horizontal {
+                return (CARD_WIDTH, CARD_WIDTH, -1, -1);
+            }
+            let width = if for_size < 0 { CARD_WIDTH } else { for_size };
+            let mut bottom = 0;
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                let next = widget.next_sibling();
+                let y = widget
+                    .downcast_ref::<super::SlideBin>()
+                    .map(super::SlideBin::layout_y)
+                    .unwrap_or(0.0);
+                let (_, height, _, _) = widget.measure(Orientation::Vertical, width);
+                bottom = bottom.max(y.round() as i32 + height.max(0));
+                child = next;
+            }
+            let bottom = bottom.max(0);
+            (bottom, bottom, -1, -1)
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                let next = widget.next_sibling();
+                let y = widget
+                    .downcast_ref::<super::SlideBin>()
+                    .map(super::SlideBin::layout_y)
+                    .unwrap_or(0.0);
+                let (_, child_height, _, _) = widget.measure(Orientation::Vertical, width);
+                widget.size_allocate(
+                    &gtk::Allocation::new(0, y.round() as i32, width, child_height.max(1)),
+                    -1,
+                );
+                child = next;
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct ToastColumn(ObjectSubclass<column::ToastColumn>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl ToastColumn {
+    fn new() -> Self {
+        glib::Object::builder().build()
+    }
+
+    fn add_card(&self, card: &SlideBin) {
+        if card.parent().is_some() {
+            card.unparent();
+        }
+        card.set_parent(self);
+    }
+
+    fn remove_card(&self, card: &SlideBin) {
+        if card.parent().is_some() {
+            card.unparent();
+        }
+    }
+}
+
+mod fade {
+    use super::*;
+
+    pub struct CrossfadeBin {
+        pub(super) current: RefCell<Option<gtk::Widget>>,
+        pub(super) outgoing: RefCell<Option<gtk::Widget>>,
+        pub(super) blend: Cell<f64>,
+        pub(super) locked: Cell<i32>,
+    }
+
+    impl Default for CrossfadeBin {
+        fn default() -> Self {
+            Self {
+                current: RefCell::new(None),
+                outgoing: RefCell::new(None),
+                blend: Cell::new(1.0),
+                locked: Cell::new(-1),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for CrossfadeBin {
+        const NAME: &'static str = "DenDenCrossfadeBin";
+        type Type = super::CrossfadeBin;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for CrossfadeBin {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.obj().set_overflow(Overflow::Hidden);
+        }
+
+        fn dispose(&self) {
+            if let Some(child) = self.current.borrow_mut().take() {
+                child.unparent();
+            }
+            if let Some(child) = self.outgoing.borrow_mut().take() {
+                child.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for CrossfadeBin {
+        fn measure(&self, orientation: Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            if orientation == Orientation::Vertical && self.locked.get() > 0 {
+                let height = self.locked.get();
+                return (height, height, -1, -1);
+            }
+            self.current
+                .borrow()
+                .as_ref()
+                .map(|child| child.measure(orientation, for_size))
+                .unwrap_or((0, 0, -1, -1))
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            self.parent_size_allocate(width, height, baseline);
+            let allocation = gtk::Allocation::new(0, 0, width, height);
+            if let Some(child) = self.current.borrow().as_ref() {
+                child.size_allocate(&allocation, baseline);
+            }
+            if let Some(child) = self.outgoing.borrow().as_ref() {
+                child.size_allocate(&allocation, baseline);
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            let blend = self.blend.get().clamp(0.0, 1.0) as f32;
+            let has_outgoing = self.outgoing.borrow().is_some();
+            if has_outgoing && blend < 1.0 {
+                if let Some(old) = self.outgoing.borrow().as_ref() {
+                    let alpha = 1.0 - blend;
+                    if alpha > 0.0 {
+                        snapshot.push_opacity(f64::from(alpha));
+                        self.obj().snapshot_child(old, snapshot);
+                        snapshot.pop();
+                    }
+                }
+            }
+            if let Some(current) = self.current.borrow().as_ref() {
+                let alpha = if has_outgoing { blend } else { 1.0 };
+                if alpha > 0.0 {
+                    let pushed = alpha < 1.0;
+                    if pushed {
+                        snapshot.push_opacity(f64::from(alpha));
+                    }
+                    self.obj().snapshot_child(current, snapshot);
+                    if pushed {
+                        snapshot.pop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    pub struct CrossfadeBin(ObjectSubclass<fade::CrossfadeBin>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl CrossfadeBin {
+    fn new() -> Self {
+        glib::Object::builder().build()
+    }
+
+    fn set_current(&self, child: &gtk::Widget) {
+        let imp = self.imp();
+        if let Some(old) = imp.current.borrow_mut().take() {
+            old.unparent();
+        }
+        if let Some(old) = imp.outgoing.borrow_mut().take() {
+            old.unparent();
+        }
+        child.set_parent(self);
+        *imp.current.borrow_mut() = Some(child.clone());
+        imp.blend.set(1.0);
+        imp.locked.set(-1);
+    }
+
+    /// Keep the outgoing face and fade to `new_child`. `old_height` is the
+    /// card's current height, held for the length of the crossfade.
+    fn start(&self, new_child: &gtk::Widget, old_height: i32) {
+        let imp = self.imp();
+        if let Some(previous) = imp.outgoing.borrow_mut().take() {
+            previous.unparent();
+        }
+        if let Some(old) = imp.current.borrow_mut().take() {
+            old.set_can_target(false);
+            *imp.outgoing.borrow_mut() = Some(old);
+        }
+        new_child.set_parent(self);
+        *imp.current.borrow_mut() = Some(new_child.clone());
+        let (_, measured, _, _) = new_child.measure(Orientation::Vertical, CARD_WIDTH);
+        let locked = if old_height > 1 {
+            old_height
+        } else {
+            measured.max(1)
+        };
+        imp.locked.set(locked);
+        imp.blend.set(0.0);
+        self.queue_resize();
+    }
+
+    fn set_blend(&self, blend: f64) {
+        let blend = blend.clamp(0.0, 1.0);
+        let imp = self.imp();
+        imp.blend.set(blend);
+        if blend >= 1.0 {
+            if let Some(old) = imp.outgoing.borrow_mut().take() {
+                old.unparent();
+            }
+            if imp.locked.replace(-1) >= 0 {
+                self.queue_resize();
+            }
+        }
+        self.queue_draw();
     }
 }

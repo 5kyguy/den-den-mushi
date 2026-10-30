@@ -302,7 +302,15 @@ timeout_low_ms = 4000
 timeout_normal_ms = 5000
 history_max = 100
 history_persist = true
+motion = true
 ```
+
+`motion` defaults to true. A card enters from 24px to the right and fades in
+over 180ms (ease-out), and leaves the same way in reverse over 120ms
+(ease-in). Cards below a dismissed one move up on a spring. `replaces_id`,
+and a stack tag (`x-dunst-stack-tag` or `x-canonical-private-synchronous`,
+same app), crossfade that card's content in place over 120ms. `motion = false`
+skips those, and the panel's slide, and jumps to the end state.
 
 r2-d2 already blurs this layer. `config/hypr/looknfeel.lua` uses the current
 `hl.layer_rule` form (the same one the Hyprland wiki documents for layer
@@ -365,3 +373,8 @@ do-not-disturb, and a live recolor from `theme.json`. Screenshots are the
 grim captures of that session. Pointer clicks were not driven; there is no
 pointer device on that headless seat. Left click, right click, and the
 action buttons are GTK gestures and buttons on the card.
+
+A later capture on that same headless sway records three cards entering,
+the middle one leaving while the card below springs up, and a `replaces_id`
+crossfade. The layer-shell input region is the visible part of each card
+during that motion. Clicks through the gap were not driven.

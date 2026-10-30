@@ -7,6 +7,7 @@ readme = "README.md"
 rust-version = "1.85"
 
 [dependencies]
+cairo-rs = "0.20"
 gtk4 = { version = "0.9.7", features = ["v4_14"] }
 gtk4-layer-shell = "0.5"
 libc = "0.2"

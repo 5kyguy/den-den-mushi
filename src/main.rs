@@ -4,6 +4,7 @@ mod cli;
 mod gaps;
 mod history;
 mod model;
+mod motion;
 mod panel;
 mod panel_ui;
 mod rules;

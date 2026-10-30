@@ -267,6 +267,7 @@ dependencies = [
 name = "den-den-mushi"
 version = "0.1.0"
 dependencies = [
+ "cairo-rs",
  "futures-util",
  "gtk4",
  "gtk4-layer-shell",

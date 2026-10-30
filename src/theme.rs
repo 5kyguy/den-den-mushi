@@ -171,6 +171,9 @@ pub struct FileConfig {
     pub timeout_normal_ms: Option<u64>,
     pub history_max: Option<u64>,
     pub history_persist: Option<bool>,
+    /// Card enter, exit, restack, and replace. `false` snaps. Default on.
+    /// The panel slide follows the same switch.
+    pub motion: Option<bool>,
     /// Read-only defaults. The daemon does not write `config.toml`.
     /// `rules.toml` replaces this list once that file exists.
     pub rules: Vec<crate::rules::AppRule>,
@@ -201,6 +204,8 @@ pub struct Settings {
     pub history_max: usize,
     /// When false, history stays in memory and the state file is not touched.
     pub history_persist: bool,
+    /// When false, card and panel animations jump to their end state.
+    pub motion: bool,
 }
 
 impl Settings {
@@ -215,6 +220,7 @@ impl Settings {
             timeout_normal_ms: parsed.timeout_normal_ms.unwrap_or(5_000).max(1),
             history_max: clamp_history_max(parsed.history_max),
             history_persist: parsed.history_persist.unwrap_or(true),
+            motion: parsed.motion.unwrap_or(true),
         }
     }
 }
@@ -422,6 +428,7 @@ mod tests {
         let defaults = Settings::from_config(FileConfig::default());
         assert_eq!(defaults.history_max, DEFAULT_HISTORY_MAX);
         assert!(defaults.history_persist);
+        assert!(defaults.motion);
         assert_eq!(defaults.timeout_normal_ms, 5_000);
 
         let custom: FileConfig =
@@ -472,5 +479,16 @@ app = "Mail"
         let settings = Settings::from_config(parsed);
         assert_eq!(settings.history_max, 25);
         assert!(!settings.history_persist);
+    }
+
+    #[test]
+    fn motion_defaults_on_and_can_be_turned_off() {
+        assert!(Settings::from_config(FileConfig::default()).motion);
+        let off: FileConfig = toml::from_str("motion = false\n").unwrap();
+        assert!(!Settings::from_config(off).motion);
+        let on: FileConfig = toml::from_str("motion = true\nhistory_max = 4\n").unwrap();
+        let settings = Settings::from_config(on);
+        assert!(settings.motion);
+        assert_eq!(settings.history_max, 4);
     }
 }
