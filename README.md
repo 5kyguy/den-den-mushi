@@ -113,11 +113,18 @@ stack is a no-op.
 ### History
 
 Every notification the daemon receives is kept, newest first, including
-ones do-not-disturb suppresses (those are stored already dismissed). The
-fields are the id, app name, icon, summary, body, urgency, Unix timestamp,
-actions, and whether it was dismissed. Dismissed means freedesktop close
-reason 2 (the user, `dismiss`, or `invoke`). Expiry and a client
-`CloseNotification` stay in the list with `dismissed` false.
+ones do-not-disturb suppresses (those are stored already dismissed). A
+notification with the freedesktop `transient` hint set is shown and not
+saved. The fields are the id, app name, icon, summary, body, urgency, Unix
+timestamp, actions, and whether it was dismissed. Dismissed means
+freedesktop close reason 2 (the user, `dismiss`, or `invoke`). Expiry and a
+client `CloseNotification` stay in the list with `dismissed` false.
+
+Ids keep going after a restart. The next id is one past the highest id
+already in the file, and a saved id is never issued again while that entry
+exists. `RemoveHistory` and `InvokeHistory` therefore name one entry. A
+`replaces_id` updates that entry only when the notification is still on
+screen.
 
 The icon is a glyph, a theme icon name, or a file path. Pixel data from
 `image-data` is not stored; that notification keeps the fallback glyph.

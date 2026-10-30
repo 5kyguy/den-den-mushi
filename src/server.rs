@@ -96,6 +96,7 @@ impl NotificationService {
         let body = clamp(body, 8_000);
         let urgency = hint_urgency(&hints);
         let resident = hint_bool(&hints, "resident");
+        let transient = hint_bool(&hints, "transient");
         let category = hint_string(&hints, "category").unwrap_or_default();
         let battery = is_battery(&category, &app_name, &summary, &body);
         let glyph_hint = hint_string(&hints, "r2-d2-glyph");
@@ -114,12 +115,18 @@ impl NotificationService {
 
         let suppressed = !allows_popup(self.shared.dnd.load(Ordering::SeqCst), &app_name, urgency);
         let mut guard = self.shared.inner.lock().expect("notification map");
-        let id = if suppressed {
-            guard.allocate(replaces_id)
-        } else if replaces_id != 0 && guard.active.contains_key(&replaces_id) {
-            replaces_id
-        } else {
-            guard.allocate(0)
+        // History is locked only to choose an id. A saved id is not free, so a
+        // new notification cannot overwrite that entry. A live replaces_id is
+        // the same notification and keeps its id.
+        let id = {
+            let history = self.shared.history.lock().expect("history");
+            if suppressed {
+                guard.allocate(replaces_id, &history)
+            } else if replaces_id != 0 && guard.active.contains_key(&replaces_id) {
+                replaces_id
+            } else {
+                guard.allocate(0, &history)
+            }
         };
         let note = Note {
             id,
@@ -147,7 +154,10 @@ impl NotificationService {
             drop(guard);
             eprintln!("den-den-mushi: suppressed id={id} app={app_name} (do not disturb)");
             // Received, then closed immediately. Keep it in history as dismissed.
-            self.shared.remember(&note, &actions, true);
+            // `transient` is an explicit request not to keep the notification.
+            if !transient {
+                self.shared.remember(&note, &actions, true);
+            }
             let _ = self.shared.signal_tx.send(OutSignal::Closed {
                 id,
                 reason: REASON_DISMISSED,
@@ -161,7 +171,9 @@ impl NotificationService {
         );
         guard.upsert(note.clone());
         drop(guard);
-        self.shared.remember(&note, &actions, false);
+        if !transient {
+            self.shared.remember(&note, &actions, false);
+        }
         let _ = self.shared.ui_tx.send(UiEvent::Upsert(note));
         id
     }
@@ -321,14 +333,18 @@ pub trait Control {
 }
 
 impl Inner {
-    fn allocate(&mut self, preferred: u32) -> u32 {
-        if preferred != 0 && !self.active.contains_key(&preferred) {
+    /// Next id that is neither on screen nor already saved.
+    fn allocate(&mut self, preferred: u32, history: &HistoryLog) -> u32 {
+        let free = |inner: &Inner, id: u32| {
+            id != 0 && !inner.active.contains_key(&id) && !history.contains_id(id)
+        };
+        if preferred != 0 && free(self, preferred) {
             return preferred;
         }
         loop {
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1).max(1);
-            if id != 0 && !self.active.contains_key(&id) {
+            if free(self, id) {
                 return id;
             }
         }
@@ -359,6 +375,28 @@ impl Inner {
 }
 
 impl Shared {
+    /// `next_id` starts at one past the highest saved id so a restart cannot
+    /// hand out an id that history still uses.
+    fn with_history(
+        history: HistoryLog,
+        dnd: Arc<AtomicBool>,
+        ui_tx: std::sync::mpsc::Sender<UiEvent>,
+        signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
+    ) -> Self {
+        let next_id = history.next_id_seed();
+        Self {
+            inner: Mutex::new(Inner {
+                next_id,
+                active: HashMap::new(),
+                order: VisibleCards::default(),
+            }),
+            history: Mutex::new(history),
+            dnd,
+            ui_tx,
+            signal_tx,
+        }
+    }
+
     /// Returns whether the stored value changed.
     fn apply_dnd(&self, on: bool) -> bool {
         if self.dnd.swap(on, Ordering::SeqCst) == on {
@@ -519,21 +557,12 @@ pub async fn serve(
     replace: bool,
 ) -> Result<(), String> {
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let shared = Arc::new(Shared {
-        inner: Mutex::new(Inner {
-            next_id: 1,
-            active: HashMap::new(),
-            order: VisibleCards::default(),
-        }),
-        history: Mutex::new(HistoryLog::load(
-            settings.history_max,
-            settings.history_persist,
-            theme::history_path(),
-        )),
-        dnd,
-        ui_tx,
-        signal_tx,
-    });
+    let history = HistoryLog::load(
+        settings.history_max,
+        settings.history_persist,
+        theme::history_path(),
+    );
+    let shared = Arc::new(Shared::with_history(history, dnd, ui_tx, signal_tx));
     let service = NotificationService {
         shared: Arc::clone(&shared),
         low_timeout: settings.timeout_low_ms,
@@ -780,17 +809,12 @@ mod tests {
     ) {
         let (ui_tx, ui_rx) = std::sync::mpsc::channel();
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Arc::new(Shared {
-            inner: Mutex::new(Inner {
-                next_id: 1,
-                active: HashMap::new(),
-                order: VisibleCards::default(),
-            }),
-            history: Mutex::new(HistoryLog::memory(100)),
-            dnd: Arc::new(AtomicBool::new(false)),
+        let shared = Arc::new(Shared::with_history(
+            HistoryLog::memory(100),
+            Arc::new(AtomicBool::new(false)),
             ui_tx,
             signal_tx,
-        });
+        ));
         (shared, ui_rx, signal_rx)
     }
 
@@ -1088,6 +1112,198 @@ mod tests {
         let history = shared.history.lock().expect("history");
         assert_eq!(history.entries().len(), 1);
         assert!(!history.entries()[0].dismissed);
+    }
+
+    #[test]
+    fn restart_keeps_saved_entries_and_issues_a_new_id() {
+        let scratch = RestartDir::new();
+        let path = scratch.path();
+        let mut saved = HistoryLog::load(100, true, path.clone());
+        let mut first = blank(1);
+        first.summary = "kept one".into();
+        let mut fourth = blank(4);
+        fourth.summary = "kept four".into();
+        assert!(saved.record(&first, &[], false));
+        assert!(saved.record(&fourth, &[], true));
+        saved.store();
+        drop(saved);
+
+        let history = HistoryLog::load(100, true, path.clone());
+        assert_eq!(history.next_id_seed(), 5);
+        let (shared, ui_rx, _signals) = shared_with(history);
+        let service = NotificationService {
+            shared: Arc::clone(&shared),
+            low_timeout: 4_000,
+            normal_timeout: 5_000,
+        };
+        let id = service.notify(
+            "Spotify",
+            0,
+            "",
+            "after restart",
+            "new body",
+            vec![],
+            HashMap::new(),
+            -1,
+        );
+        assert_eq!(id, 5);
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => assert_eq!(note.id, 5),
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        assert_history(
+            &shared,
+            &[(5, "after restart"), (4, "kept four"), (1, "kept one")],
+        );
+
+        // replaces_id of a saved notification is not that entry: it is closed.
+        let fresh = service.notify(
+            "Mail",
+            1,
+            "",
+            "not the old one",
+            "",
+            vec![],
+            HashMap::new(),
+            -1,
+        );
+        assert_eq!(fresh, 6);
+        assert_history(
+            &shared,
+            &[
+                (6, "not the old one"),
+                (5, "after restart"),
+                (4, "kept four"),
+                (1, "kept one"),
+            ],
+        );
+
+        // A card that is still up keeps its id and its history row.
+        let replaced = service.notify(
+            "Spotify",
+            5,
+            "",
+            "replaced",
+            "updated",
+            vec![],
+            HashMap::new(),
+            -1,
+        );
+        assert_eq!(replaced, 5);
+        assert_history(
+            &shared,
+            &[
+                (5, "replaced"),
+                (6, "not the old one"),
+                (4, "kept four"),
+                (1, "kept one"),
+            ],
+        );
+
+        let loaded = HistoryLog::load(100, true, path);
+        assert_history_log(
+            &loaded,
+            &[
+                (5, "replaced"),
+                (6, "not the old one"),
+                (4, "kept four"),
+                (1, "kept one"),
+            ],
+        );
+    }
+
+    #[test]
+    fn transient_notifications_are_shown_and_not_stored() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        let service = NotificationService {
+            shared: Arc::clone(&shared),
+            low_timeout: 4_000,
+            normal_timeout: 5_000,
+        };
+        let mut hints = HashMap::new();
+        hints.insert("transient".into(), OwnedValue::from(true));
+        let id = service.notify("OSD", 0, "", "volume", "50%", vec![], hints, -1);
+        assert!(shared.history.lock().expect("history").entries().is_empty());
+        assert!(signals.try_recv().is_err());
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, id);
+                assert_eq!(note.summary, "volume");
+            }
+            other => panic!("unexpected ui event {other:?}"),
+        }
+
+        let kept = service.notify("Mail", 0, "", "hello", "", vec![], HashMap::new(), -1);
+        assert_ne!(kept, id);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        let entries = shared.history.lock().expect("history").entries().to_vec();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, kept);
+        assert_eq!(entries[0].summary, "hello");
+    }
+
+    fn shared_with(
+        history: HistoryLog,
+    ) -> (
+        Arc<Shared>,
+        std::sync::mpsc::Receiver<UiEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<OutSignal>,
+    ) {
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::with_history(
+            history,
+            Arc::new(AtomicBool::new(false)),
+            ui_tx,
+            signal_tx,
+        ));
+        (shared, ui_rx, signal_rx)
+    }
+
+    fn assert_history(shared: &Shared, expect: &[(u32, &str)]) {
+        let history = shared.history.lock().expect("history");
+        assert_history_log(&history, expect);
+    }
+
+    fn assert_history_log(history: &HistoryLog, expect: &[(u32, &str)]) {
+        let entries = history.entries();
+        assert_eq!(entries.len(), expect.len());
+        let mut seen = std::collections::HashSet::new();
+        for (entry, (id, summary)) in entries.iter().zip(expect) {
+            assert_eq!(entry.id, *id);
+            assert_eq!(entry.summary, *summary);
+            assert!(seen.insert(entry.id), "duplicate history id {}", entry.id);
+        }
+    }
+
+    struct RestartDir {
+        dir: PathBuf,
+    }
+
+    impl RestartDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "den-den-mushi-restart-{}-{nanos}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("restart dir");
+            Self { dir }
+        }
+
+        fn path(&self) -> PathBuf {
+            self.dir.join("history.json")
+        }
+    }
+
+    impl Drop for RestartDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]

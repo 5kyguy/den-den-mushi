@@ -114,6 +114,24 @@ impl HistoryLog {
         &self.entries
     }
 
+    /// First freedesktop id that is not already saved.
+    ///
+    /// The counter starts here after a restart so a new notification cannot
+    /// reuse an id that `RemoveHistory` and `InvokeHistory` still mean.
+    pub fn next_id_seed(&self) -> u32 {
+        self.entries
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1)
+    }
+
+    pub fn contains_id(&self, id: u32) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
+
     /// JSON array, newest first. This is the `History` return value.
     pub fn to_json(&self) -> String {
         serde_json::to_string(&self.entries).unwrap_or_else(|_| "[]".to_string())
@@ -402,6 +420,16 @@ mod tests {
         for id in ids {
             assert!(log.record(&note(*id, &format!("note {id}")), &actions(), false));
         }
+    }
+
+    #[test]
+    fn id_seed_is_one_past_the_highest_saved_id() {
+        let mut log = HistoryLog::memory(10);
+        assert_eq!(log.next_id_seed(), 1);
+        record_all(&mut log, &[1, 7, 3]);
+        assert_eq!(log.next_id_seed(), 8);
+        assert!(log.contains_id(7));
+        assert!(!log.contains_id(8));
     }
 
     #[test]
