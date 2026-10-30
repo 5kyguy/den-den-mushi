@@ -62,6 +62,9 @@ pub const GLYPH_EMAIL: &str = "\u{f01ee}";
 pub const GLYPH_MUSIC: &str = "\u{f075a}";
 pub const GLYPH_WEB: &str = "\u{f059f}";
 pub const GLYPH_TERMINAL: &str = "\u{f018d}";
+/// nf-md-chevron_right / nf-md-chevron_down. Same Material set as the app glyphs.
+pub const GLYPH_CHEVRON_RIGHT: &str = "\u{f0142}";
+pub const GLYPH_CHEVRON_DOWN: &str = "\u{f0140}";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Urgency {

@@ -5,12 +5,13 @@
 
 use crate::history::HistoryLog;
 use crate::model::{
-    allows_popup, decode_image_data, expire_ms, glyph_for, is_battery, pair_actions,
-    parse_exec_argv, IconSource, Note, Urgency, VisibleCards, REASON_CLOSED, REASON_DISMISSED,
+    decode_image_data, expire_ms, glyph_for, is_battery, pair_actions, parse_exec_argv, IconSource,
+    Note, Urgency, VisibleCards, REASON_CLOSED, REASON_DISMISSED,
 };
+use crate::rules::{self, AppRule, RuleSet, RuleTimeout};
 use crate::theme::{self, Settings};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zbus::fdo::RequestNameFlags;
@@ -23,8 +24,18 @@ use zbus::{interface, ConnectionBuilder};
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Upsert(Note),
-    Dismiss { id: u32 },
+    Dismiss {
+        id: u32,
+    },
     ReloadTheme,
+    /// `den-den-mushi panel` asked the overlay to show or hide.
+    TogglePanel,
+    /// Latest history, rules, and do-not-disturb, from the control API.
+    PanelState {
+        history_json: String,
+        rules_json: String,
+        dnd: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -46,6 +57,7 @@ enum OutSignal {
     Closed { id: u32, reason: u32 },
     Action { id: u32, key: String },
     HistoryChanged,
+    RulesChanged,
 }
 
 struct Inner {
@@ -61,6 +73,10 @@ struct Inner {
 struct Shared {
     inner: Mutex<Inner>,
     history: Mutex<HistoryLog>,
+    rules: Mutex<RuleSet>,
+    /// `rules.toml`. Empty in tests that do not persist rules.
+    /// `config.toml` is never written.
+    rules_path: PathBuf,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
@@ -105,6 +121,11 @@ impl NotificationService {
         if exec.is_some() {
             has_default = true;
         }
+        let stored_app = if app_name.is_empty() {
+            "notify".to_string()
+        } else {
+            app_name.clone()
+        };
         let expire = expire_ms(
             expire_timeout,
             urgency,
@@ -112,8 +133,16 @@ impl NotificationService {
             self.low_timeout,
             self.normal_timeout,
         );
-
-        let suppressed = !allows_popup(self.shared.dnd.load(Ordering::SeqCst), &app_name, urgency);
+        let rule = self.shared.rule_for(&stored_app);
+        let delivery = rules::apply_rule(
+            self.shared.dnd.load(Ordering::SeqCst),
+            &stored_app,
+            urgency,
+            expire,
+            rule.as_ref(),
+        );
+        let suppressed = !delivery.show_popup;
+        let muted = rule.is_some_and(|rule| rule.muted);
         let mut guard = self.shared.inner.lock().expect("notification map");
         // History is locked only to choose an id. A saved id is not free, so a
         // new notification cannot overwrite that entry. A live replaces_id is
@@ -130,11 +159,7 @@ impl NotificationService {
         };
         let note = Note {
             id,
-            app_name: if app_name.is_empty() {
-                "notify".into()
-            } else {
-                app_name.clone()
-            },
+            app_name: stored_app.clone(),
             summary,
             body,
             icon: icon_from_hints(app_icon, &hints),
@@ -143,7 +168,7 @@ impl NotificationService {
             has_default,
             urgency,
             battery,
-            expire_ms: expire,
+            expire_ms: delivery.expire_ms,
             exec,
             created_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -152,7 +177,8 @@ impl NotificationService {
         };
         if suppressed {
             drop(guard);
-            eprintln!("den-den-mushi: suppressed id={id} app={app_name} (do not disturb)");
+            let why = if muted { "muted" } else { "do not disturb" };
+            eprintln!("den-den-mushi: suppressed id={id} app={stored_app} ({why})");
             // Received, then closed immediately. Keep it in history as dismissed.
             // `transient` is an explicit request not to keep the notification.
             if !transient {
@@ -305,8 +331,54 @@ impl Controller {
         self.shared.invoke_history(id);
     }
 
+    /// Show or hide the notification panel.
+    fn toggle_panel(&self) {
+        eprintln!("den-den-mushi: toggle panel");
+        let _ = self.shared.ui_tx.send(UiEvent::TogglePanel);
+    }
+
+    /// Saved per-app rules as a JSON array.
+    ///
+    /// Apps with no rule are not listed. The panel treats those as mute off,
+    /// timeout `default`, bypass off.
+    fn rules(&self) -> String {
+        self.shared.rules_json()
+    }
+
+    /// Replace the rule for `app`.
+    ///
+    /// `timeout` is `default`, `5s`, `10s`, or `sticky`. A rule that is mute
+    /// off, timeout `default`, and bypass off is deleted. The new list is
+    /// written to `rules.toml`. `config.toml` is left untouched.
+    /// `RulesChanged` is emitted when the list changes.
+    fn set_rule(
+        &self,
+        app: &str,
+        muted: bool,
+        timeout: &str,
+        bypass_dnd: bool,
+    ) -> zbus::fdo::Result<()> {
+        if app.trim().is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("app name is empty".into()));
+        }
+        let timeout = RuleTimeout::parse(timeout).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs("timeout must be default, 5s, 10s, or sticky".into())
+        })?;
+        self.shared
+            .set_rule(AppRule {
+                app: app.to_string(),
+                muted,
+                timeout,
+                bypass_dnd,
+            })
+            .map_err(zbus::fdo::Error::Failed)
+    }
+
     #[zbus(signal)]
     async fn history_changed(ctxt: &SignalContext<'_>) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn rules_changed(ctxt: &SignalContext<'_>) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -327,9 +399,16 @@ pub trait Control {
     fn clear_history(&self) -> zbus::Result<()>;
     fn remove_history(&self, id: u32) -> zbus::Result<()>;
     fn invoke_history(&self, id: u32) -> zbus::Result<()>;
+    fn toggle_panel(&self) -> zbus::Result<()>;
+    fn rules(&self) -> zbus::Result<String>;
+    fn set_rule(&self, app: &str, muted: bool, timeout: &str, bypass_dnd: bool)
+        -> zbus::Result<()>;
 
     #[zbus(signal)]
     fn history_changed(&self) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn rules_changed(&self) -> zbus::Result<()>;
 }
 
 impl Inner {
@@ -379,6 +458,8 @@ impl Shared {
     /// hand out an id that history still uses.
     fn with_history(
         history: HistoryLog,
+        rules: RuleSet,
+        rules_path: PathBuf,
         dnd: Arc<AtomicBool>,
         ui_tx: std::sync::mpsc::Sender<UiEvent>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
@@ -391,6 +472,8 @@ impl Shared {
                 order: VisibleCards::default(),
             }),
             history: Mutex::new(history),
+            rules: Mutex::new(rules),
+            rules_path,
             dnd,
             ui_tx,
             signal_tx,
@@ -528,6 +611,41 @@ impl Shared {
         let _ = self.signal_tx.send(OutSignal::HistoryChanged);
     }
 
+    fn rule_for(&self, app: &str) -> Option<AppRule> {
+        self.rules.lock().expect("rules").get(app).cloned()
+    }
+
+    fn rules_json(&self) -> String {
+        self.rules.lock().expect("rules").to_json()
+    }
+
+    fn set_rule(&self, rule: AppRule) -> Result<(), String> {
+        let app = rule.app.clone();
+        let muted = rule.muted;
+        let timeout = rule.timeout.as_str();
+        let bypass = rule.bypass_dnd;
+        let mut guard = self.rules.lock().expect("rules");
+        let mut next = guard.clone();
+        if !next.set(rule) {
+            return Ok(());
+        }
+        if !self.rules_path.as_os_str().is_empty() {
+            rules::store_rules(&self.rules_path, next.rules())?;
+        }
+        let cleared = next.get(&app).is_none();
+        *guard = next;
+        drop(guard);
+        if cleared {
+            eprintln!("den-den-mushi: rule cleared app={app}");
+        } else {
+            eprintln!(
+                "den-den-mushi: rule app={app} muted={muted} timeout={timeout} bypass_dnd={bypass}"
+            );
+        }
+        let _ = self.signal_tx.send(OutSignal::RulesChanged);
+        Ok(())
+    }
+
     fn emit_action(&self, id: u32, key: &str, exec: Option<Vec<String>>) {
         if let Some(argv) = exec {
             spawn_exec(&argv);
@@ -551,6 +669,8 @@ async fn publish_dnd(controller: &Controller, on: bool, ctxt: &SignalContext<'_>
 
 pub async fn serve(
     settings: Settings,
+    rules: RuleSet,
+    rules_path: PathBuf,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
@@ -562,7 +682,9 @@ pub async fn serve(
         settings.history_persist,
         theme::history_path(),
     );
-    let shared = Arc::new(Shared::with_history(history, dnd, ui_tx, signal_tx));
+    let shared = Arc::new(Shared::with_history(
+        history, rules, rules_path, dnd, ui_tx, signal_tx,
+    ));
     let service = NotificationService {
         shared: Arc::clone(&shared),
         low_timeout: settings.timeout_low_ms,
@@ -618,6 +740,7 @@ pub async fn serve(
                     NotificationService::action_invoked(&context, id, &key).await
                 }
                 OutSignal::HistoryChanged => Controller::history_changed(&history_context).await,
+                OutSignal::RulesChanged => Controller::rules_changed(&history_context).await,
             };
             if let Err(error) = result {
                 eprintln!("den-den-mushi: signal: {error}");
@@ -831,6 +954,8 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared::with_history(
             HistoryLog::memory(100),
+            RuleSet::new(Vec::new()),
+            PathBuf::new(),
             Arc::new(AtomicBool::new(false)),
             ui_tx,
             signal_tx,
@@ -1280,6 +1405,195 @@ mod tests {
         assert_eq!(entries[1].summary, "kept zero");
     }
 
+    #[test]
+    fn rules_change_whether_a_notification_pops_up_and_how_long_it_lasts() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        let service = NotificationService {
+            shared: Arc::clone(&shared),
+            low_timeout: 4_000,
+            normal_timeout: 5_000,
+        };
+
+        shared
+            .set_rule(AppRule {
+                app: "Spotify".into(),
+                muted: true,
+                timeout: RuleTimeout::FiveSeconds,
+                bypass_dnd: true,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+
+        let hidden = service.notify(
+            "Spotify",
+            0,
+            "",
+            "Now playing",
+            "Jet Plane",
+            vec![],
+            HashMap::new(),
+            1_500,
+        );
+        assert!(ui_rx.try_recv().is_err(), "a muted app does not pop up");
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: hidden,
+                reason: REASON_DISMISSED,
+            }
+        );
+        let saved = shared.history.lock().expect("history").entries().to_vec();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, hidden);
+        assert_eq!(saved[0].summary, "Now playing");
+        assert!(saved[0].dismissed);
+
+        let mut transient = HashMap::new();
+        transient.insert("transient".into(), OwnedValue::from(1_i32));
+        let skipped = service.notify("Spotify", 0, "", "volume", "50%", vec![], transient, -1);
+        assert_ne!(skipped, hidden);
+        assert!(ui_rx.try_recv().is_err());
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: skipped,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert_eq!(shared.history.lock().expect("history").entries().len(), 1);
+
+        shared.dnd.store(true, Ordering::SeqCst);
+        shared
+            .set_rule(AppRule {
+                app: "Mail".into(),
+                muted: false,
+                timeout: RuleTimeout::TenSeconds,
+                bypass_dnd: true,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+        let mail = service.notify(
+            "Mail",
+            0,
+            "",
+            "New message",
+            "From sky",
+            vec![],
+            HashMap::new(),
+            1_500,
+        );
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, mail);
+                assert_eq!(note.app_name, "Mail");
+                assert_eq!(note.expire_ms, Some(rules::TIMEOUT_10S_MS));
+            }
+            other => panic!("bypass should show the card, got {other:?}"),
+        }
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        let mail_entry = shared
+            .history
+            .lock()
+            .expect("history")
+            .entries()
+            .iter()
+            .find(|entry| entry.id == mail)
+            .unwrap()
+            .clone();
+        assert!(!mail_entry.dismissed);
+
+        shared.dnd.store(false, Ordering::SeqCst);
+        shared
+            .set_rule(AppRule {
+                app: "Timer".into(),
+                muted: false,
+                timeout: RuleTimeout::FiveSeconds,
+                bypass_dnd: false,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+        let timer = service.notify(
+            "Timer",
+            0,
+            "",
+            "Short",
+            "was 1500",
+            vec![],
+            HashMap::new(),
+            1_500,
+        );
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, timer);
+                assert_eq!(note.expire_ms, Some(rules::TIMEOUT_5S_MS));
+            }
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+
+        shared
+            .set_rule(AppRule {
+                app: "System".into(),
+                muted: false,
+                timeout: RuleTimeout::Sticky,
+                bypass_dnd: false,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+        let system = service.notify(
+            "System",
+            0,
+            "",
+            "Disk",
+            "Back up",
+            vec![],
+            HashMap::new(),
+            1_500,
+        );
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, system);
+                assert_eq!(note.expire_ms, None);
+            }
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+
+        // A fully default rule is not stored and does not signal.
+        shared
+            .set_rule(AppRule {
+                app: "Venmo".into(),
+                muted: false,
+                timeout: RuleTimeout::Default,
+                bypass_dnd: false,
+            })
+            .unwrap();
+        assert!(signals.try_recv().is_err());
+        let venmo = service.notify("Venmo", 0, "", "Paid", "ok", vec![], HashMap::new(), 2_500);
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, venmo);
+                assert_eq!(note.expire_ms, Some(2_500));
+            }
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+
+        shared.dnd.store(true, Ordering::SeqCst);
+        let dropped = service.notify("Venmo", 0, "", "hidden", "dnd", vec![], HashMap::new(), -1);
+        assert!(ui_rx.try_recv().is_err());
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: dropped,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+    }
+
     fn shared_with(
         history: HistoryLog,
     ) -> (
@@ -1291,6 +1605,8 @@ mod tests {
         let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared::with_history(
             history,
+            RuleSet::new(Vec::new()),
+            PathBuf::new(),
             Arc::new(AtomicBool::new(false)),
             ui_tx,
             signal_tx,
@@ -1342,6 +1658,63 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn set_rule_leaves_a_symlinked_config_byte_identical() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "den-den-mushi-set-rule-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real-config.toml");
+        let config_bytes = b"# comment stays\nhistory_max = 40\nnamespace = \"kept\"\n";
+        std::fs::write(&real, config_bytes).unwrap();
+        let config = dir.join("config.toml");
+        symlink(&real, &config).unwrap();
+        let rules_path = dir.join("rules.toml");
+
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel();
+        let (signal_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::with_history(
+            HistoryLog::memory(10),
+            RuleSet::new(Vec::new()),
+            rules_path.clone(),
+            Arc::new(AtomicBool::new(false)),
+            ui_tx,
+            signal_tx,
+        ));
+        shared
+            .set_rule(AppRule {
+                app: "Spotify".into(),
+                muted: true,
+                timeout: RuleTimeout::FiveSeconds,
+                bypass_dnd: false,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&real).unwrap(), config_bytes);
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        let saved = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(saved.contains("Spotify"));
+        assert!(saved.contains("5s"));
+        let mode = std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|name| !name.ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1460,8 +1833,18 @@ mod tests {
             history_max: 100,
             history_persist: false,
         };
+        let config_dir = theme::state_dir().join("cfg");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let real_config = config_dir.join("real-config.toml");
+        let config_bytes = b"# keep this comment\nhistory_max = 40\nnamespace = \"kept\"\n";
+        std::fs::write(&real_config, config_bytes).expect("config");
+        let config_path = config_dir.join("config.toml");
+        std::os::unix::fs::symlink(&real_config, &config_path).expect("symlink");
+        let rules_path = config_dir.join("rules.toml");
         serve(
             settings,
+            RuleSet::new(Vec::new()),
+            rules_path,
             Arc::new(AtomicBool::new(false)),
             ui_tx,
             cmd_rx,
@@ -1562,6 +1945,7 @@ mod tests {
         control.dismiss(false).await.expect("dismiss empty");
         control.invoke().await.expect("invoke empty");
         exercise_history(&control, &notes).await;
+        exercise_rules_and_panel(&control, &ui_rx).await;
     }
 
     async fn exercise_history(control: &ControlProxy<'_>, notes: &NoteBusProxy<'_>) {
@@ -1703,6 +2087,73 @@ mod tests {
         assert!(hidden_entry.dismissed);
         assert_eq!(hidden_entry.summary, "hidden");
         control.set_do_not_disturb(false).await.expect("dnd off");
+    }
+
+    async fn exercise_rules_and_panel(
+        control: &ControlProxy<'_>,
+        ui_rx: &std::sync::mpsc::Receiver<UiEvent>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        while ui_rx.try_recv().is_ok() {}
+        let config_dir = theme::state_dir().join("cfg");
+        let config_path = config_dir.join("config.toml");
+        let real_config = config_dir.join("real-config.toml");
+        let rules_path = config_dir.join("rules.toml");
+        let before = std::fs::read(&config_path).unwrap();
+        assert!(config_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(control.rules().await.expect("rules"), "[]");
+
+        let rejected = control.set_rule("Spotify", true, "nope", false).await;
+        assert!(rejected.is_err(), "a bad timeout is rejected");
+        assert_eq!(control.rules().await.expect("rules"), "[]");
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(!rules_path.exists());
+
+        let mut changed = control.receive_rules_changed().await.expect("rules stream");
+        control
+            .set_rule("Spotify", true, "5s", false)
+            .await
+            .expect("set rule");
+        next_stream(&mut changed).await;
+        let rules = rules::rules_from_json(&control.rules().await.expect("rules")).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].app, "Spotify");
+        assert!(rules[0].muted);
+        assert_eq!(rules[0].timeout, RuleTimeout::FiveSeconds);
+        assert!(!rules[0].bypass_dnd);
+
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert_eq!(std::fs::read(&real_config).unwrap(), before);
+        assert!(config_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let rules_text = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(rules_text.contains("Spotify"));
+        assert!(rules_text.contains("5s"));
+        let mode = std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        control
+            .set_rule("Spotify", false, "default", false)
+            .await
+            .expect("clear rule");
+        next_stream(&mut changed).await;
+        assert_eq!(control.rules().await.expect("rules"), "[]");
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(rules_path.exists());
+
+        control.toggle_panel().await.expect("toggle panel");
+        match ui_rx.try_recv().expect("toggle event") {
+            UiEvent::TogglePanel => {}
+            other => panic!("expected TogglePanel, got {other:?}"),
+        }
     }
 
     async fn history_entries(control: &ControlProxy<'_>) -> Vec<crate::history::HistoryEntry> {

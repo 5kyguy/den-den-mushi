@@ -160,6 +160,65 @@ directory, so a reader sees the previous list or the new one. The on-disk
 document is `{"version": 1, "entries": [ ... ]}` with the newest entry
 first. Clearing the list writes an empty `entries` array.
 
+### Panel
+
+```bash
+den-den-mushi panel
+```
+
+That calls `TogglePanel` on `com.skyguy.DenDenMushi`. The daemon opens a
+layer-shell panel on the right edge, 380px wide, inset by the same
+`gaps_out` and bar reserved-top the cards use. It slides in over 200ms
+and out over 140ms. Esc closes it, and so does a click outside once the
+panel has taken keyboard focus (`keyboard-interactivity` is on-demand,
+and only while the panel is open).
+
+The header is the app-line style title `NOTIFICATIONS`, a do-not-disturb
+switch, and `Clear all`. Turning do not disturb on colors the switch
+track with the accent and draws a thin accent line under the header.
+The search field filters the list as you type, matching the app name,
+title, and body. History is grouped by app, newest first, with a sticky
+header (glyph, uppercase name, count). A row is the title and a relative
+time, then the body clamped to two lines. Hover shows ×, which calls
+`RemoveHistory`. A click calls `InvokeHistory`. An empty list says
+`All caught up.`
+
+The panel is a client of the control API below. It does not keep a
+second copy of history or of do not disturb.
+
+### Rules
+
+The bottom of the panel is a collapsible list, one row per app that has
+history or a saved rule: mute, a timeout (`default`, `5s`, `10s`,
+`sticky`), and bypass do-not-disturb. Changes go through `SetRule` and
+are written to `~/.config/den-den-mushi/rules.toml` immediately. The
+daemon applies them on the next notification.
+
+`config.toml` is read-only. `SetRule` does not rewrite it, so comments,
+key order, and a symlink (for example into another repo) stay as they
+are. `[[rules]]` in `config.toml` are defaults, used only when
+`rules.toml` does not exist yet. Once `rules.toml` exists it is the
+whole list, including after every rule has been cleared. The file is
+replaced by renaming a temporary file in that directory. Its mode is
+`0600`, and the directory mode is `0700`, same as the history file.
+
+Mute does not pop the card up. The notification is still stored in
+history, already dismissed, the same way do-not-disturb stores one,
+unless the sender set `transient`. Mute wins over bypass and over a
+critical urgency. Bypass shows the card while do-not-disturb is on.
+`default` keeps the usual timeout. `5s` and `10s` replace it. `sticky`
+does not auto-expire. A rule that is mute off, timeout `default`, and
+bypass off is removed from `rules.toml`.
+
+```toml
+# ~/.config/den-den-mushi/rules.toml
+[[rules]]
+app = "Spotify"
+muted = true
+timeout = "5s"
+bypass_dnd = false
+```
+
 ### Control API
 
 The commands above are clients of one interface, `com.skyguy.DenDenMushi`,
@@ -176,6 +235,10 @@ this interface, not a second protocol.
 | `RemoveHistory(id: u32)` | Delete one saved notification |
 | `InvokeHistory(id: u32)` | Default action if that notification is still on screen |
 | `HistoryChanged` | Emitted when the saved list changes |
+| `TogglePanel()` | Show or hide the notification panel |
+| `Rules()` | JSON array of saved per-app rules |
+| `SetRule(app, muted, timeout, bypass_dnd)` | Write one app's rule to `rules.toml`. `timeout` is `default`, `5s`, `10s`, or `sticky` |
+| `RulesChanged` | Emitted when the saved rules change |
 | `SetDoNotDisturb(on: bool)` | Writes do not disturb |
 | `DoNotDisturb` | Read-only property. `PropertiesChanged` when it changes |
 | `ReloadTheme()`, `Visible()`, `GetDoNotDisturb()` | Theme reload, on-screen ids, and the same flag as the property |
@@ -198,8 +261,8 @@ busctl --user get-property org.freedesktop.Notifications /com/skyguy/DenDenMushi
   com.skyguy.DenDenMushi DoNotDisturb
 ```
 
-A future history panel should call these methods. This daemon does not
-change quickshell or r2-d2.
+The panel calls these methods. This daemon does not change quickshell
+or r2-d2.
 
 ### Hyprland
 
@@ -207,8 +270,9 @@ In `hyprland.conf`:
 
 ```
 exec-once = den-den-mushi
-bind = SUPER, N, exec, den-den-mushi dismiss
-bind = SUPER SHIFT, N, exec, den-den-mushi dismiss --all
+bind = SUPER, N, exec, den-den-mushi panel
+bind = SUPER SHIFT, N, exec, den-den-mushi dismiss
+bind = SUPER CTRL, N, exec, den-den-mushi dismiss --all
 bind = SUPER, A, exec, den-den-mushi invoke
 ```
 

@@ -4,13 +4,16 @@ mod cli;
 mod gaps;
 mod history;
 mod model;
+mod panel;
+mod panel_ui;
+mod rules;
 mod server;
 mod theme;
 mod ui;
 
 use cli::{
     format_dnd, format_history, next_dnd, parse_dismiss_all, parse_dnd_args, parse_history_args,
-    parse_invoke_args, DndArgs, HistoryArgs,
+    parse_invoke_args, parse_panel_args, DndArgs, HistoryArgs,
 };
 use futures_util::StreamExt;
 use history::parse_entries;
@@ -67,6 +70,18 @@ fn main() {
                 std::process::exit(2);
             }
             if let Err(error) = invoke() {
+                eprintln!("den-den-mushi: {error}");
+                std::process::exit(1);
+            }
+        }
+        Some("panel") => {
+            let rest: Vec<String> = args.collect();
+            let refs: Vec<&str> = rest.iter().map(String::as_str).collect();
+            if let Err(error) = parse_panel_args(&refs) {
+                eprintln!("den-den-mushi: {error}");
+                std::process::exit(2);
+            }
+            if let Err(error) = toggle_panel() {
                 eprintln!("den-den-mushi: {error}");
                 std::process::exit(1);
             }
@@ -129,6 +144,7 @@ Usage:
                              List saved notifications, newest first
   den-den-mushi history clear
                              Delete saved notifications
+  den-den-mushi panel        Show or hide the notification panel
   den-den-mushi dnd          Toggle do not disturb
   den-den-mushi dnd on|off|toggle|status [--json] [--watch]
   den-den-mushi reload       Reread the theme (also SIGUSR1)
@@ -141,8 +157,9 @@ history. `--watch` prints the current state, then another line whenever
 it changes, and exits on SIGINT or a closed pipe.
 
 These commands call com.skyguy.DenDenMushi on the session bus
-(Dismiss, Invoke, History, ClearHistory, SetDoNotDisturb, and the
-DoNotDisturb property)."
+(Dismiss, Invoke, History, ClearHistory, TogglePanel,
+SetDoNotDisturb, and the DoNotDisturb property). The panel is a
+client of that same object."
     );
 }
 
@@ -151,9 +168,12 @@ fn run_daemon(replace: bool) {
         env::set_var("GDK_BACKEND", "wayland");
     }
     let _pid = PidFile::write();
-    let settings = theme::Settings::load();
+    let config = theme::FileConfig::load();
+    let settings = theme::Settings::from_config(config.clone());
+    let rules = rules::RuleSet::new(rules::load_rules(&config.rules, &theme::rules_path()));
     let dnd = Arc::new(AtomicBool::new(theme::read_dnd()));
     let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+    let ui_tx_panel = ui_tx.clone();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -161,6 +181,8 @@ fn run_daemon(replace: bool) {
         .expect("tokio");
     if let Err(error) = runtime.block_on(server::serve(
         settings.clone(),
+        rules,
+        theme::rules_path(),
         Arc::clone(&dnd),
         ui_tx,
         cmd_rx,
@@ -169,7 +191,14 @@ fn run_daemon(replace: bool) {
         eprintln!("den-den-mushi: {error}");
         std::process::exit(1);
     }
-    ui::run(settings, dnd, ui_rx, cmd_tx);
+    ui::run(
+        settings,
+        dnd,
+        ui_rx,
+        cmd_tx,
+        runtime.handle().clone(),
+        ui_tx_panel,
+    );
 }
 
 fn dnd(args: DndArgs) -> Result<(), String> {
@@ -268,6 +297,19 @@ fn dismiss(all: bool) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?;
         proxy.dismiss(all).await.map_err(|error| error.to_string())
+    })
+}
+
+fn toggle_panel() -> Result<(), String> {
+    runtime().block_on(async {
+        let connection = session().await?;
+        let proxy = ControlProxy::new(&connection)
+            .await
+            .map_err(|error| error.to_string())?;
+        proxy
+            .toggle_panel()
+            .await
+            .map_err(|error| error.to_string())
     })
 }
 

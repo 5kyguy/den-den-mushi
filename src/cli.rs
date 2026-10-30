@@ -116,6 +116,13 @@ pub fn parse_invoke_args(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn parse_panel_args(args: &[&str]) -> Result<(), String> {
+    if let Some(extra) = args.first() {
+        return Err(format!("panel does not take arguments ('{extra}')"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryArgs {
     pub clear: bool,
@@ -287,6 +294,8 @@ mod tests {
         assert!(parse_dismiss_all(&["all"]).is_err());
         assert!(parse_invoke_args(&[]).is_ok());
         assert!(parse_invoke_args(&["--all"]).is_err());
+        assert!(parse_panel_args(&[]).is_ok());
+        assert!(parse_panel_args(&["--rules"]).is_err());
     }
 
     #[test]

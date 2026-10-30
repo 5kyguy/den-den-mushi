@@ -54,12 +54,12 @@ already applies the new accent. The reload line is the same hook walker uses.
 
 | Role | Where |
 | --- | --- |
-| `bg` | Card body |
-| `surface` | Hover, and the quiet action pills |
-| `line` | Hairline border |
-| `accent` | App name and the left edge |
-| `on_accent` | Label of an action pill while it is hovered |
-| `text` / `muted` | Title and body |
+| `bg` | Card body and the notification panel |
+| `surface` | Hover, quiet action pills, the panel search field, and the timeout menu |
+| `line` | Hairline border on cards and the panel |
+| `accent` | App name, the left edge, and the do-not-disturb line |
+| `on_accent` | Label of an action pill while it is hovered, and a switch handle while it is on |
+| `text` / `muted` | Title, body, Clear all, the search placeholder, and the empty state |
 | `danger` / `on_danger` | Critical urgency |
 | `warning` / `on_warning` | Low-battery notifications |
 
