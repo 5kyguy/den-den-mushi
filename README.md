@@ -104,10 +104,11 @@ den-den-mushi invoke        # default action on the newest card, then close it
 ```
 
 `dismiss` emits `NotificationClosed` with reason 2 (dismissed by the user).
-`invoke` emits `ActionInvoked` with key `default` and then closes the card
-with reason 2. A left click sends that action when the card has a default
-action. Right click on a card dismisses that card, also with reason 2. An
-empty stack is a no-op.
+`invoke` emits `ActionInvoked` with key `default` only when the newest card
+offered that action, then closes it with reason 2. A card with no default
+action is only dismissed. A left click sends the action in the same case.
+Right click on a card dismisses that card, also with reason 2. An empty
+stack is a no-op.
 
 ### Control API
 
@@ -119,7 +120,7 @@ this interface, not a second protocol.
 | Member | Role |
 | --- | --- |
 | `Dismiss(all: bool)` | Newest card, or every card |
-| `Invoke()` | Default action on the newest card, then close it |
+| `Invoke()` | Default action when the newest card has one, then close it |
 | `SetDoNotDisturb(on: bool)` | Writes do not disturb |
 | `DoNotDisturb` | Read-only property. `PropertiesChanged` when it changes |
 | `ReloadTheme()`, `Visible()`, `GetDoNotDisturb()` | Theme reload, on-screen ids, and the same flag as the property |

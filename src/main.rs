@@ -104,7 +104,7 @@ Usage:
   den-den-mushi dismiss      Close the newest card
   den-den-mushi dismiss --all
                              Close every card
-  den-den-mushi invoke       Run the newest card's default action and close it
+  den-den-mushi invoke       Default action if the newest card has one, then close it
   den-den-mushi dnd          Toggle do not disturb
   den-den-mushi dnd on|off|toggle|status [--json] [--watch]
   den-den-mushi reload       Reread the theme (also SIGUSR1)

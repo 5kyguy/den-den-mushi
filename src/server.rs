@@ -211,10 +211,11 @@ impl Controller {
         self.shared.dismiss(all);
     }
 
-    /// Run the newest card's default action and close it.
+    /// Run the newest card's default action when it has one, then close it.
     ///
-    /// Emits `ActionInvoked` with key `default`, then `NotificationClosed`
-    /// with reason 2. A left click sends that action when the card has one.
+    /// A card that offered `default` emits `ActionInvoked` with that key,
+    /// then `NotificationClosed` with reason 2. A card that did not is only
+    /// dismissed, with that same close reason and no action signal.
     fn invoke(&self) {
         self.shared.invoke_newest();
     }
@@ -367,7 +368,7 @@ impl Shared {
     }
 
     fn invoke_newest(&self) {
-        let (id, exec) = {
+        let (id, has_default, exec) = {
             let mut guard = self.inner.lock().expect("notification map");
             let Some(id) = guard.newest() else {
                 return;
@@ -375,9 +376,14 @@ impl Shared {
             let Some(note) = guard.remove(id) else {
                 return;
             };
-            (id, note.exec)
+            (id, note.has_default, note.exec)
         };
-        self.emit_action(id, "default", exec);
+        if has_default {
+            self.emit_action(id, "default", exec);
+        } else {
+            eprintln!("den-den-mushi: dismiss id={id}");
+            self.emit_closed(id, REASON_DISMISSED);
+        }
     }
 
     fn emit_action(&self, id: u32, key: &str, exec: Option<Vec<String>>) {
@@ -812,6 +818,29 @@ mod tests {
         );
         shared.invoke_newest();
         assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn invoke_without_a_default_action_only_dismisses() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        let mut note = blank(5);
+        note.has_default = false;
+        // An exec hint without a default action must not be launched.
+        note.exec = Some(vec!["should-not-run".into()]);
+        shared.inner.lock().expect("notification map").upsert(note);
+        shared.invoke_newest();
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 5,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Dismiss { id: 5 } => {}
+            other => panic!("unexpected ui event {other:?}"),
+        }
     }
 
     #[test]
