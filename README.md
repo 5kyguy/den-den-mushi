@@ -115,7 +115,9 @@ stack is a no-op.
 Every notification the daemon receives is kept, newest first, including
 ones do-not-disturb suppresses (those are stored already dismissed). A
 notification with the freedesktop `transient` hint set is shown and not
-saved. The fields are the id, app name, icon, summary, body, urgency, Unix
+saved. That includes boolean `true` and the `1` from
+`notify-send -h int:transient:1`. The fields are the id, app name, icon,
+summary, body, urgency, Unix
 timestamp, actions, and whether it was dismissed. Dismissed means
 freedesktop close reason 2 (the user, `dismiss`, or `invoke`). Expiry and a
 client `CloseNotification` stay in the list with `dismissed` false.

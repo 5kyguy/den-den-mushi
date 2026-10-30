@@ -96,7 +96,7 @@ impl NotificationService {
         let body = clamp(body, 8_000);
         let urgency = hint_urgency(&hints);
         let resident = hint_bool(&hints, "resident");
-        let transient = hint_bool(&hints, "transient");
+        let transient = hint_flag(&hints, "transient");
         let category = hint_string(&hints, "category").unwrap_or_default();
         let battery = is_battery(&category, &app_name, &summary, &body);
         let glyph_hint = hint_string(&hints, "r2-d2-glyph");
@@ -694,6 +694,26 @@ fn hint_bool(hints: &HashMap<String, OwnedValue>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Boolean hint, or the non-zero integer `notify-send -h int:transient:1` sends.
+fn hint_flag(hints: &HashMap<String, OwnedValue>, key: &str) -> bool {
+    let Some(value) = hints.get(key) else {
+        return false;
+    };
+    if let Ok(flag) = bool::try_from(value) {
+        return flag;
+    }
+    if let Ok(byte) = u8::try_from(value) {
+        return byte != 0;
+    }
+    if let Ok(number) = i32::try_from(value) {
+        return number != 0;
+    }
+    if let Ok(number) = u32::try_from(value) {
+        return number != 0;
+    }
+    false
+}
+
 fn hint_urgency(hints: &HashMap<String, OwnedValue>) -> Urgency {
     let Some(value) = hints.get("urgency") else {
         return Urgency::Normal;
@@ -1220,26 +1240,44 @@ mod tests {
             low_timeout: 4_000,
             normal_timeout: 5_000,
         };
-        let mut hints = HashMap::new();
-        hints.insert("transient".into(), OwnedValue::from(true));
-        let id = service.notify("OSD", 0, "", "volume", "50%", vec![], hints, -1);
-        assert!(shared.history.lock().expect("history").entries().is_empty());
-        assert!(signals.try_recv().is_err());
+        let mut shown = Vec::new();
+        for hint in [
+            OwnedValue::from(true),
+            OwnedValue::from(1_i32),
+            OwnedValue::from(1_u8),
+        ] {
+            let mut hints = HashMap::new();
+            hints.insert("transient".into(), hint);
+            let id = service.notify("OSD", 0, "", "volume", "50%", vec![], hints, -1);
+            shown.push(id);
+            assert!(shared.history.lock().expect("history").entries().is_empty());
+            assert!(signals.try_recv().is_err());
+        }
         match ui_rx.try_recv().unwrap() {
             UiEvent::Upsert(note) => {
-                assert_eq!(note.id, id);
+                assert_eq!(note.id, shown[0]);
                 assert_eq!(note.summary, "volume");
             }
             other => panic!("unexpected ui event {other:?}"),
         }
+        assert!(matches!(ui_rx.try_recv().unwrap(), UiEvent::Upsert(_)));
+        assert!(matches!(ui_rx.try_recv().unwrap(), UiEvent::Upsert(_)));
+
+        // Zero is not "true", so this one is saved.
+        let mut zero = HashMap::new();
+        zero.insert("transient".into(), OwnedValue::from(0_i32));
+        let stored = service.notify("OSD", 0, "", "kept zero", "", vec![], zero, -1);
+        assert!(!shown.contains(&stored));
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
 
         let kept = service.notify("Mail", 0, "", "hello", "", vec![], HashMap::new(), -1);
-        assert_ne!(kept, id);
+        assert!(!shown.contains(&kept));
         assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
         let entries = shared.history.lock().expect("history").entries().to_vec();
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, kept);
         assert_eq!(entries[0].summary, "hello");
+        assert_eq!(entries[1].summary, "kept zero");
     }
 
     fn shared_with(
