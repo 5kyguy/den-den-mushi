@@ -100,6 +100,15 @@ pub fn dnd_path() -> PathBuf {
     state_dir().join("dnd")
 }
 
+pub fn history_path() -> PathBuf {
+    state_dir().join("history.json")
+}
+
+/// Default number of history entries. `history_max` in config.toml overrides it.
+pub const DEFAULT_HISTORY_MAX: usize = 100;
+/// Largest `history_max` that is honored. A larger config value is clamped.
+pub const HISTORY_MAX_LIMIT: usize = 10_000;
+
 pub fn style_paths() -> Vec<PathBuf> {
     let mut paths = vec![config_dir().join("style.css")];
     if let Some(root) = std::env::var_os("R2D2_PATH") {
@@ -150,6 +159,8 @@ pub struct FileConfig {
     pub namespace: Option<String>,
     pub timeout_low_ms: Option<u64>,
     pub timeout_normal_ms: Option<u64>,
+    pub history_max: Option<u64>,
+    pub history_persist: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +169,9 @@ pub struct Settings {
     pub namespace: String,
     pub timeout_low_ms: u64,
     pub timeout_normal_ms: u64,
+    pub history_max: usize,
+    /// When false, history stays in memory and the state file is not touched.
+    pub history_persist: bool,
 }
 
 impl Settings {
@@ -167,6 +181,10 @@ impl Settings {
             .ok()
             .and_then(|text| toml::from_str::<FileConfig>(&text).ok())
             .unwrap_or_default();
+        Self::from_config(parsed)
+    }
+
+    pub fn from_config(parsed: FileConfig) -> Self {
         Self {
             margin: parsed.margin,
             namespace: parsed
@@ -175,8 +193,16 @@ impl Settings {
                 .unwrap_or_else(|| "r2-d2-notifications".into()),
             timeout_low_ms: parsed.timeout_low_ms.unwrap_or(4_000).max(1),
             timeout_normal_ms: parsed.timeout_normal_ms.unwrap_or(5_000).max(1),
+            history_max: clamp_history_max(parsed.history_max),
+            history_persist: parsed.history_persist.unwrap_or(true),
         }
     }
+}
+
+fn clamp_history_max(value: Option<u64>) -> usize {
+    value
+        .unwrap_or(DEFAULT_HISTORY_MAX as u64)
+        .min(HISTORY_MAX_LIMIT as u64) as usize
 }
 
 pub fn load_theme() -> Theme {
@@ -359,5 +385,27 @@ mod tests {
     fn broken_theme_json_is_ignored() {
         assert!(parse_theme_json("{").is_none());
         assert!(parse_theme_json(r#"{"colors":{"dark":{"accent":"blue"}}}"#).is_none());
+    }
+
+    #[test]
+    fn history_settings_default_to_a_private_capped_log() {
+        let defaults = Settings::from_config(FileConfig::default());
+        assert_eq!(defaults.history_max, DEFAULT_HISTORY_MAX);
+        assert!(defaults.history_persist);
+        assert_eq!(defaults.timeout_normal_ms, 5_000);
+
+        let custom: FileConfig =
+            toml::from_str("history_max = 25\nhistory_persist = false\ntimeout_low_ms = 1500\n")
+                .unwrap();
+        let settings = Settings::from_config(custom);
+        assert_eq!(settings.history_max, 25);
+        assert!(!settings.history_persist);
+        assert_eq!(settings.timeout_low_ms, 1_500);
+
+        let zero: FileConfig = toml::from_str("history_max = 0\n").unwrap();
+        assert_eq!(Settings::from_config(zero).history_max, 0);
+
+        let huge: FileConfig = toml::from_str("history_max = 999999\n").unwrap();
+        assert_eq!(Settings::from_config(huge).history_max, HISTORY_MAX_LIMIT);
     }
 }

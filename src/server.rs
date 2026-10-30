@@ -3,6 +3,7 @@
 //! The GTK thread never runs inside a D-Bus method. Notifications cross
 //! to the UI on a channel, and clicks come back the same way.
 
+use crate::history::HistoryLog;
 use crate::model::{
     allows_popup, decode_image_data, expire_ms, glyph_for, is_battery, pair_actions,
     parse_exec_argv, IconSource, Note, Urgency, VisibleCards, REASON_CLOSED, REASON_DISMISSED,
@@ -44,6 +45,7 @@ pub enum UiCommand {
 enum OutSignal {
     Closed { id: u32, reason: u32 },
     Action { id: u32, key: String },
+    HistoryChanged,
 }
 
 struct Inner {
@@ -58,6 +60,7 @@ struct Inner {
 /// caller is the CLI, a card click, or a later control dashboard.
 struct Shared {
     inner: Mutex<Inner>,
+    history: Mutex<HistoryLog>,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
@@ -109,19 +112,11 @@ impl NotificationService {
             self.normal_timeout,
         );
 
+        let suppressed = !allows_popup(self.shared.dnd.load(Ordering::SeqCst), &app_name, urgency);
         let mut guard = self.shared.inner.lock().expect("notification map");
-        if !allows_popup(self.shared.dnd.load(Ordering::SeqCst), &app_name, urgency) {
-            let id = guard.allocate(replaces_id);
-            drop(guard);
-            eprintln!("den-den-mushi: suppressed id={id} app={app_name} (do not disturb)");
-            let _ = self.shared.signal_tx.send(OutSignal::Closed {
-                id,
-                reason: REASON_DISMISSED,
-            });
-            return id;
-        }
-
-        let id = if replaces_id != 0 && guard.active.contains_key(&replaces_id) {
+        let id = if suppressed {
+            guard.allocate(replaces_id)
+        } else if replaces_id != 0 && guard.active.contains_key(&replaces_id) {
             replaces_id
         } else {
             guard.allocate(0)
@@ -148,12 +143,25 @@ impl NotificationService {
                 .map(|duration| duration.as_secs() as i64)
                 .unwrap_or(0),
         };
+        if suppressed {
+            drop(guard);
+            eprintln!("den-den-mushi: suppressed id={id} app={app_name} (do not disturb)");
+            // Received, then closed immediately. Keep it in history as dismissed.
+            self.shared.remember(&note, &actions, true);
+            let _ = self.shared.signal_tx.send(OutSignal::Closed {
+                id,
+                reason: REASON_DISMISSED,
+            });
+            return id;
+        }
+
         eprintln!(
             "den-den-mushi: notify id={id} app={} urgency={:?}",
             note.app_name, note.urgency
         );
         guard.upsert(note.clone());
         drop(guard);
+        self.shared.remember(&note, &actions, false);
         let _ = self.shared.ui_tx.send(UiEvent::Upsert(note));
         id
     }
@@ -202,6 +210,9 @@ impl NotificationService {
 /// `/com/skyguy/DenDenMushi`, served by the owner of
 /// `org.freedesktop.Notifications`. `DoNotDisturb` is a property.
 /// `SetDoNotDisturb` writes it and emits `PropertiesChanged` when it changes.
+/// History methods are the same object: a dashboard calls `History`,
+/// `ClearHistory`, `RemoveHistory`, and `InvokeHistory`, and listens for
+/// `HistoryChanged`.
 #[interface(name = "com.skyguy.DenDenMushi")]
 impl Controller {
     /// Close the newest visible card, or every card when `all` is true.
@@ -255,6 +266,35 @@ impl Controller {
         ids.sort_unstable();
         ids
     }
+
+    /// Saved notifications, newest first, as a JSON array.
+    ///
+    /// Image pixel data is not included. A dashboard calls this, then
+    /// `ClearHistory`, `RemoveHistory`, or `InvokeHistory`.
+    fn history(&self) -> String {
+        self.shared.history.lock().expect("history").to_json()
+    }
+
+    fn clear_history(&self) {
+        self.shared.clear_history();
+    }
+
+    fn remove_history(&self, id: u32) {
+        self.shared.remove_history(id);
+    }
+
+    /// Default action for a notification that is still on screen.
+    ///
+    /// The sender is still waiting on that id, so this emits `ActionInvoked`
+    /// with key `default` when the card offered one, then closes it. A card
+    /// with no default action is only dismissed. An id that is only in
+    /// history is left alone: the app was already told the notification closed.
+    fn invoke_history(&self, id: u32) {
+        self.shared.invoke_history(id);
+    }
+
+    #[zbus(signal)]
+    async fn history_changed(ctxt: &SignalContext<'_>) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -271,6 +311,13 @@ pub trait Control {
     fn get_do_not_disturb(&self) -> zbus::Result<bool>;
     fn reload_theme(&self) -> zbus::Result<()>;
     fn visible(&self) -> zbus::Result<Vec<u32>>;
+    fn history(&self) -> zbus::Result<String>;
+    fn clear_history(&self) -> zbus::Result<()>;
+    fn remove_history(&self, id: u32) -> zbus::Result<()>;
+    fn invoke_history(&self, id: u32) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn history_changed(&self) -> zbus::Result<()>;
 }
 
 impl Inner {
@@ -328,6 +375,9 @@ impl Shared {
     }
 
     fn emit_closed(&self, id: u32, reason: u32) {
+        if reason == REASON_DISMISSED {
+            self.mark_history_dismissed(id);
+        }
         let _ = self.signal_tx.send(OutSignal::Closed { id, reason });
         let _ = self.ui_tx.send(UiEvent::Dismiss { id });
     }
@@ -378,12 +428,66 @@ impl Shared {
             };
             (id, note.has_default, note.exec)
         };
+        self.finish_default(id, has_default, exec);
+    }
+
+    /// `InvokeHistory`. No signal when the notification is already closed.
+    fn invoke_history(&self, id: u32) {
+        let (has_default, exec) = {
+            let mut guard = self.inner.lock().expect("notification map");
+            let Some(note) = guard.remove(id) else {
+                return;
+            };
+            (note.has_default, note.exec)
+        };
+        self.finish_default(id, has_default, exec);
+    }
+
+    fn finish_default(&self, id: u32, has_default: bool, exec: Option<Vec<String>>) {
         if has_default {
             self.emit_action(id, "default", exec);
         } else {
             eprintln!("den-den-mushi: dismiss id={id}");
             self.emit_closed(id, REASON_DISMISSED);
         }
+    }
+
+    fn remember(&self, note: &Note, actions: &[String], dismissed: bool) {
+        let mut history = self.history.lock().expect("history");
+        if !history.record(note, actions, dismissed) {
+            return;
+        }
+        history.store();
+        let _ = self.signal_tx.send(OutSignal::HistoryChanged);
+    }
+
+    fn mark_history_dismissed(&self, id: u32) {
+        let mut history = self.history.lock().expect("history");
+        if !history.mark_dismissed(id) {
+            return;
+        }
+        history.store();
+        let _ = self.signal_tx.send(OutSignal::HistoryChanged);
+    }
+
+    fn clear_history(&self) {
+        let mut history = self.history.lock().expect("history");
+        if !history.clear() {
+            return;
+        }
+        history.store();
+        eprintln!("den-den-mushi: history cleared");
+        let _ = self.signal_tx.send(OutSignal::HistoryChanged);
+    }
+
+    fn remove_history(&self, id: u32) {
+        let mut history = self.history.lock().expect("history");
+        if !history.remove(id) {
+            return;
+        }
+        history.store();
+        eprintln!("den-den-mushi: history remove id={id}");
+        let _ = self.signal_tx.send(OutSignal::HistoryChanged);
     }
 
     fn emit_action(&self, id: u32, key: &str, exec: Option<Vec<String>>) {
@@ -421,6 +525,11 @@ pub async fn serve(
             active: HashMap::new(),
             order: VisibleCards::default(),
         }),
+        history: Mutex::new(HistoryLog::load(
+            settings.history_max,
+            settings.history_persist,
+            theme::history_path(),
+        )),
         dnd,
         ui_tx,
         signal_tx,
@@ -468,6 +577,8 @@ pub async fn serve(
         .map_err(|error| error.to_string())?;
     let control_context = SignalContext::new(&connection, "/com/skyguy/DenDenMushi")
         .map_err(|error| error.to_string())?;
+    let history_context = SignalContext::new(&connection, "/com/skyguy/DenDenMushi")
+        .map_err(|error| error.to_string())?;
     tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
             let result = match signal {
@@ -477,6 +588,7 @@ pub async fn serve(
                 OutSignal::Action { id, key } => {
                     NotificationService::action_invoked(&context, id, &key).await
                 }
+                OutSignal::HistoryChanged => Controller::history_changed(&history_context).await,
             };
             if let Err(error) = result {
                 eprintln!("den-den-mushi: signal: {error}");
@@ -674,6 +786,7 @@ mod tests {
                 active: HashMap::new(),
                 order: VisibleCards::default(),
             }),
+            history: Mutex::new(HistoryLog::memory(100)),
             dnd: Arc::new(AtomicBool::new(false)),
             ui_tx,
             signal_tx,
@@ -876,6 +989,108 @@ mod tests {
     }
 
     #[test]
+    fn history_follows_dismiss_and_invoke_only_while_the_card_is_up() {
+        let (shared, _, mut signals) = test_shared();
+        let mut first = blank(1);
+        first.summary = "older".into();
+        let mut second = blank(2);
+        second.summary = "newer".into();
+        second.has_default = true;
+        shared.remember(&first, &[], false);
+        shared.inner.lock().expect("notification map").upsert(first);
+        shared.remember(&second, &["default".into(), "Open".into()], false);
+        shared
+            .inner
+            .lock()
+            .expect("notification map")
+            .upsert(second);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+
+        shared.dismiss(false);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 2,
+                reason: REASON_DISMISSED,
+            }
+        );
+        let entries = shared.history.lock().expect("history").entries().to_vec();
+        assert_eq!(entries[0].id, 2);
+        assert!(entries[0].dismissed);
+        assert_eq!(entries[1].id, 1);
+        assert!(!entries[1].dismissed);
+
+        shared.invoke_history(1);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Action {
+                id: 1,
+                key: "default".into(),
+            }
+        );
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 1,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+        assert!(shared.history.lock().expect("history").entries()[1].dismissed);
+
+        // Already closed: the app was told, so there is no ActionInvoked.
+        shared.invoke_history(2);
+        assert!(signals.try_recv().is_err());
+
+        let mut third = blank(3);
+        third.has_default = false;
+        shared.remember(&third, &[], false);
+        shared.inner.lock().expect("notification map").upsert(third);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        shared.invoke_history(3);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 3,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+
+        shared.clear_history();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert!(shared.history.lock().expect("history").entries().is_empty());
+        shared.clear_history();
+        shared.remove_history(1);
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn expiry_does_not_mark_history_dismissed() {
+        let (shared, _, mut signals) = test_shared();
+        let note = blank(9);
+        shared.remember(&note, &[], false);
+        shared.inner.lock().expect("notification map").upsert(note);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        shared.close(9, crate::model::REASON_EXPIRED);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 9,
+                reason: crate::model::REASON_EXPIRED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+        let history = shared.history.lock().expect("history");
+        assert_eq!(history.entries().len(), 1);
+        assert!(!history.entries()[0].dismissed);
+    }
+
+    #[test]
     fn do_not_disturb_is_stored_once_per_change() {
         let _state = StateDir::lock();
         let (shared, _, _) = test_shared();
@@ -988,6 +1203,8 @@ mod tests {
             namespace: "r2-d2-notifications".into(),
             timeout_low_ms: 4_000,
             timeout_normal_ms: 5_000,
+            history_max: 100,
+            history_persist: false,
         };
         serve(
             settings,
@@ -1090,6 +1307,153 @@ mod tests {
 
         control.dismiss(false).await.expect("dismiss empty");
         control.invoke().await.expect("invoke empty");
+        exercise_history(&control, &notes).await;
+    }
+
+    async fn exercise_history(control: &ControlProxy<'_>, notes: &NoteBusProxy<'_>) {
+        use futures_util::StreamExt;
+
+        // Let HistoryChanged from the earlier notifications leave the bus
+        // before this stream is subscribed.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut changed = control
+            .receive_history_changed()
+            .await
+            .expect("history stream");
+
+        let before = history_entries(control).await;
+        assert!(before.len() >= 4, "earlier notifications were recorded");
+        assert!(before.iter().all(|entry| entry.dismissed));
+        assert!(before.windows(2).all(|pair| pair[0].id > pair[1].id));
+
+        control.clear_history().await.expect("clear history");
+        next_stream(&mut changed).await;
+        assert!(history_entries(control).await.is_empty());
+        control.clear_history().await.expect("clear empty");
+
+        let live = notes
+            .notify(
+                "Spotify",
+                0,
+                "spotify",
+                "Now playing",
+                "Jet Plane",
+                vec!["default".into(), "Open".into(), "pay".into(), "Pay".into()],
+                HashMap::new(),
+                -1,
+            )
+            .await
+            .expect("notify live");
+        next_stream(&mut changed).await;
+        let listed = history_entries(control).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, live);
+        assert_eq!(listed[0].app_name, "Spotify");
+        assert_eq!(listed[0].summary, "Now playing");
+        assert_eq!(listed[0].body, "Jet Plane");
+        assert_eq!(listed[0].urgency, "normal");
+        assert!(!listed[0].dismissed);
+        assert_eq!(
+            listed[0].icon.kind,
+            crate::history::HistoryIconKind::IconName
+        );
+        assert_eq!(listed[0].icon.value, "spotify");
+        assert_eq!(listed[0].actions.len(), 2);
+        assert_eq!(listed[0].actions[0].key, "default");
+
+        let mut invoked = notes.receive_action_invoked().await.expect("action stream");
+        let mut closed = notes
+            .receive_notification_closed()
+            .await
+            .expect("closed stream");
+        control.invoke_history(live).await.expect("invoke history");
+        let action = next_stream(&mut invoked).await;
+        let action_args = action.args().expect("action args");
+        assert_eq!(action_args.id, live);
+        assert_eq!(action_args.action_key, "default");
+        let close = next_stream(&mut closed).await;
+        assert_eq!(close.args().expect("close").reason, REASON_DISMISSED);
+        next_stream(&mut changed).await;
+        assert!(history_entries(control).await[0].dismissed);
+
+        let gone = notes
+            .notify(
+                "Mail",
+                0,
+                "",
+                "Old",
+                "already closed",
+                vec![],
+                HashMap::new(),
+                -1,
+            )
+            .await
+            .expect("notify gone");
+        next_stream(&mut changed).await;
+        control.dismiss(false).await.expect("dismiss gone");
+        next_stream(&mut changed).await;
+        let mut late = notes
+            .receive_action_invoked()
+            .await
+            .expect("late action stream");
+        control
+            .invoke_history(gone)
+            .await
+            .expect("invoke closed history");
+        let none = tokio::time::timeout(std::time::Duration::from_millis(200), late.next()).await;
+        assert!(
+            none.is_err(),
+            "InvokeHistory must not emit ActionInvoked after the notification closed"
+        );
+
+        let older = notes
+            .notify("System", 0, "", "Keep", "", vec![], HashMap::new(), -1)
+            .await
+            .expect("notify keep");
+        next_stream(&mut changed).await;
+        let newer = notes
+            .notify("System", 0, "", "Drop", "", vec![], HashMap::new(), -1)
+            .await
+            .expect("notify drop");
+        next_stream(&mut changed).await;
+        control.remove_history(newer).await.expect("remove history");
+        next_stream(&mut changed).await;
+        let left = history_entries(control).await;
+        assert!(left.iter().any(|entry| entry.id == older));
+        assert!(left.iter().all(|entry| entry.id != newer));
+        control.remove_history(newer).await.expect("remove missing");
+
+        control
+            .set_do_not_disturb(true)
+            .await
+            .expect("dnd for history");
+        let hidden = notes
+            .notify(
+                "Spotify",
+                0,
+                "",
+                "hidden",
+                "suppressed",
+                vec![],
+                HashMap::new(),
+                -1,
+            )
+            .await
+            .expect("notify suppressed");
+        next_stream(&mut changed).await;
+        let hidden_entry = history_entries(control)
+            .await
+            .into_iter()
+            .find(|entry| entry.id == hidden)
+            .expect("suppressed notification is history");
+        assert!(hidden_entry.dismissed);
+        assert_eq!(hidden_entry.summary, "hidden");
+        control.set_do_not_disturb(false).await.expect("dnd off");
+    }
+
+    async fn history_entries(control: &ControlProxy<'_>) -> Vec<crate::history::HistoryEntry> {
+        let json = control.history().await.expect("history");
+        crate::history::parse_entries(&json).expect("history json")
     }
 
     fn take_dismissals(events: &std::sync::mpsc::Receiver<UiEvent>) -> Vec<u32> {
