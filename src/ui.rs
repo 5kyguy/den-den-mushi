@@ -220,11 +220,9 @@ impl Shell {
             }
             if self.watched.changed() {
                 self.reload_theme();
-                if let Ok(text) = std::fs::read_to_string(theme::dnd_path()) {
-                    let on = text.trim() == "1"
-                        || text.trim().eq_ignore_ascii_case("on")
-                        || text.trim().eq_ignore_ascii_case("true");
-                    self.dnd.store(on, Ordering::SeqCst);
+                let on = theme::read_dnd();
+                if on != self.dnd.load(Ordering::SeqCst) {
+                    let _ = self.commands.send(UiCommand::SetDoNotDisturb(on));
                 }
                 self.watched = Watched::capture();
             }
@@ -592,6 +590,8 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     });
     content.add_controller(click);
 
+    // Right click dismisses this card with reason 2, the same close the
+    // `dismiss` command uses for the newest card.
     let right = gtk::GestureClick::new();
     right.set_button(gdk::BUTTON_SECONDARY);
     let commands_right = commands.clone();

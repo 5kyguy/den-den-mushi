@@ -5,7 +5,7 @@
 
 use crate::model::{
     allows_popup, decode_image_data, expire_ms, glyph_for, is_battery, pair_actions,
-    parse_exec_argv, IconSource, Note, Urgency, REASON_CLOSED, REASON_DISMISSED,
+    parse_exec_argv, IconSource, Note, Urgency, VisibleCards, REASON_CLOSED, REASON_DISMISSED,
 };
 use crate::theme::{self, Settings};
 use std::collections::HashMap;
@@ -17,6 +17,8 @@ use zbus::object_server::SignalContext;
 use zbus::zvariant::{OwnedValue, Structure, Value};
 use zbus::{interface, ConnectionBuilder};
 
+// `Note` is the event payload. Boxing it would only exist to satisfy the lint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Upsert(Note),
@@ -26,10 +28,19 @@ pub enum UiEvent {
 
 #[derive(Debug)]
 pub enum UiCommand {
-    Closed { id: u32, reason: u32 },
-    Action { id: u32, key: String },
+    Closed {
+        id: u32,
+        reason: u32,
+    },
+    Action {
+        id: u32,
+        key: String,
+    },
+    /// The do-not-disturb file changed outside `SetDoNotDisturb`.
+    SetDoNotDisturb(bool),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum OutSignal {
     Closed { id: u32, reason: u32 },
     Action { id: u32, key: String },
@@ -38,25 +49,34 @@ enum OutSignal {
 struct Inner {
     next_id: u32,
     active: HashMap<u32, Note>,
+    order: VisibleCards,
 }
 
-pub struct NotificationService {
-    inner: Arc<Mutex<Inner>>,
+/// State shared by the freedesktop server and the control interface.
+///
+/// Dismiss, invoke, and do-not-disturb all go through here, whether the
+/// caller is the CLI, a card click, or a later control dashboard.
+struct Shared {
+    inner: Mutex<Inner>,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
+}
+
+pub struct NotificationService {
+    shared: Arc<Shared>,
     low_timeout: u64,
     normal_timeout: u64,
 }
 
 struct Controller {
-    inner: Arc<Mutex<Inner>>,
-    dnd: Arc<AtomicBool>,
-    ui_tx: std::sync::mpsc::Sender<UiEvent>,
+    shared: Arc<Shared>,
 }
 
 #[interface(name = "org.freedesktop.Notifications")]
 impl NotificationService {
+    // Freedesktop `Notify` has this many arguments; the signature is fixed.
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
         app_name: &str,
@@ -89,12 +109,12 @@ impl NotificationService {
             self.normal_timeout,
         );
 
-        let mut guard = self.inner.lock().expect("notification map");
-        if !allows_popup(self.dnd.load(Ordering::SeqCst), &app_name, urgency) {
+        let mut guard = self.shared.inner.lock().expect("notification map");
+        if !allows_popup(self.shared.dnd.load(Ordering::SeqCst), &app_name, urgency) {
             let id = guard.allocate(replaces_id);
             drop(guard);
             eprintln!("den-den-mushi: suppressed id={id} app={app_name} (do not disturb)");
-            let _ = self.signal_tx.send(OutSignal::Closed {
+            let _ = self.shared.signal_tx.send(OutSignal::Closed {
                 id,
                 reason: REASON_DISMISSED,
             });
@@ -132,29 +152,15 @@ impl NotificationService {
             "den-den-mushi: notify id={id} app={} urgency={:?}",
             note.app_name, note.urgency
         );
-        guard.active.insert(id, note.clone());
+        guard.upsert(note.clone());
         drop(guard);
-        let _ = self.ui_tx.send(UiEvent::Upsert(note));
+        let _ = self.shared.ui_tx.send(UiEvent::Upsert(note));
         id
     }
 
     fn close_notification(&self, id: u32) {
         eprintln!("den-den-mushi: close id={id}");
-        let removed = self
-            .inner
-            .lock()
-            .expect("notification map")
-            .active
-            .remove(&id)
-            .is_some();
-        if !removed {
-            return;
-        }
-        let _ = self.ui_tx.send(UiEvent::Dismiss { id });
-        let _ = self.signal_tx.send(OutSignal::Closed {
-            id,
-            reason: REASON_CLOSED,
-        });
+        self.shared.close(id, REASON_CLOSED);
     }
 
     fn get_capabilities(&self) -> Vec<String> {
@@ -190,29 +196,54 @@ impl NotificationService {
     ) -> zbus::Result<()>;
 }
 
+/// Control API for the CLI and a future dashboard.
+///
+/// One object on the session bus: `com.skyguy.DenDenMushi` at
+/// `/com/skyguy/DenDenMushi`, served by the owner of
+/// `org.freedesktop.Notifications`. `DoNotDisturb` is a property.
+/// `SetDoNotDisturb` writes it and emits `PropertiesChanged` when it changes.
 #[interface(name = "com.skyguy.DenDenMushi")]
 impl Controller {
-    fn set_do_not_disturb(&self, on: bool) {
-        self.dnd.store(on, Ordering::SeqCst);
-        if let Err(error) = theme::write_dnd(on) {
-            eprintln!("den-den-mushi: could not store do-not-disturb: {error}");
-        }
-        eprintln!(
-            "den-den-mushi: do not disturb {}",
-            if on { "on" } else { "off" }
-        );
+    /// Close the newest visible card, or every card when `all` is true.
+    ///
+    /// Each card emits `NotificationClosed` with reason 2 (dismissed by the user).
+    fn dismiss(&self, all: bool) {
+        self.shared.dismiss(all);
+    }
+
+    /// Run the newest card's default action and close it.
+    ///
+    /// Emits `ActionInvoked` with key `default`, then `NotificationClosed`
+    /// with reason 2. A left click sends that action when the card has one.
+    fn invoke(&self) {
+        self.shared.invoke_newest();
+    }
+
+    /// Set do not disturb. Emits `PropertiesChanged` for `DoNotDisturb` when
+    /// the value changes.
+    #[zbus(name = "SetDoNotDisturb")]
+    async fn set_do_not_disturb(&self, on: bool, #[zbus(signal_context)] ctxt: SignalContext<'_>) {
+        publish_dnd(self, on, &ctxt).await;
+    }
+
+    /// Read-only view of do not disturb. Changes are signaled on
+    /// `org.freedesktop.DBus.Properties.PropertiesChanged`.
+    #[zbus(property)]
+    fn do_not_disturb(&self) -> bool {
+        self.shared.dnd.load(Ordering::SeqCst)
     }
 
     fn get_do_not_disturb(&self) -> bool {
-        self.dnd.load(Ordering::SeqCst)
+        self.do_not_disturb()
     }
 
     fn reload_theme(&self) {
-        let _ = self.ui_tx.send(UiEvent::ReloadTheme);
+        let _ = self.shared.ui_tx.send(UiEvent::ReloadTheme);
     }
 
     fn visible(&self) -> Vec<u32> {
         let mut ids: Vec<u32> = self
+            .shared
             .inner
             .lock()
             .expect("notification map")
@@ -231,7 +262,11 @@ impl Controller {
     default_path = "/com/skyguy/DenDenMushi"
 )]
 pub trait Control {
+    fn dismiss(&self, all: bool) -> zbus::Result<()>;
+    fn invoke(&self) -> zbus::Result<()>;
     fn set_do_not_disturb(&self, on: bool) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn do_not_disturb(&self) -> zbus::Result<bool>;
     fn get_do_not_disturb(&self) -> zbus::Result<bool>;
     fn reload_theme(&self) -> zbus::Result<()>;
     fn visible(&self) -> zbus::Result<Vec<u32>>;
@@ -250,6 +285,120 @@ impl Inner {
             }
         }
     }
+
+    fn upsert(&mut self, note: Note) {
+        let id = note.id;
+        self.order.insert_new(id);
+        self.active.insert(id, note);
+    }
+
+    fn remove(&mut self, id: u32) -> Option<Note> {
+        self.order.remove(id);
+        self.active.remove(&id)
+    }
+
+    fn newest(&self) -> Option<u32> {
+        self.order.newest()
+    }
+
+    fn dismiss(&mut self, all: bool) -> Vec<u32> {
+        let ids = self.order.dismiss(all);
+        for id in &ids {
+            self.active.remove(id);
+        }
+        ids
+    }
+}
+
+impl Shared {
+    /// Returns whether the stored value changed.
+    fn apply_dnd(&self, on: bool) -> bool {
+        if self.dnd.swap(on, Ordering::SeqCst) == on {
+            return false;
+        }
+        if let Err(error) = theme::write_dnd(on) {
+            eprintln!("den-den-mushi: could not store do-not-disturb: {error}");
+        }
+        eprintln!(
+            "den-den-mushi: do not disturb {}",
+            if on { "on" } else { "off" }
+        );
+        true
+    }
+
+    fn emit_closed(&self, id: u32, reason: u32) {
+        let _ = self.signal_tx.send(OutSignal::Closed { id, reason });
+        let _ = self.ui_tx.send(UiEvent::Dismiss { id });
+    }
+
+    fn close(&self, id: u32, reason: u32) {
+        let removed = self
+            .inner
+            .lock()
+            .expect("notification map")
+            .remove(id)
+            .is_some();
+        if removed {
+            self.emit_closed(id, reason);
+        }
+    }
+
+    fn dismiss(&self, all: bool) {
+        let ids = self.inner.lock().expect("notification map").dismiss(all);
+        for id in ids {
+            eprintln!("den-den-mushi: dismiss id={id}");
+            self.emit_closed(id, REASON_DISMISSED);
+        }
+    }
+
+    fn invoke_id(&self, id: u32, key: &str) {
+        let exec = {
+            let mut guard = self.inner.lock().expect("notification map");
+            let Some(note) = guard.remove(id) else {
+                return;
+            };
+            if key == "default" {
+                note.exec
+            } else {
+                None
+            }
+        };
+        self.emit_action(id, key, exec);
+    }
+
+    fn invoke_newest(&self) {
+        let (id, exec) = {
+            let mut guard = self.inner.lock().expect("notification map");
+            let Some(id) = guard.newest() else {
+                return;
+            };
+            let Some(note) = guard.remove(id) else {
+                return;
+            };
+            (id, note.exec)
+        };
+        self.emit_action(id, "default", exec);
+    }
+
+    fn emit_action(&self, id: u32, key: &str, exec: Option<Vec<String>>) {
+        if let Some(argv) = exec {
+            spawn_exec(&argv);
+        }
+        eprintln!("den-den-mushi: invoke id={id} action={key}");
+        let _ = self.signal_tx.send(OutSignal::Action {
+            id,
+            key: key.to_string(),
+        });
+        self.emit_closed(id, REASON_DISMISSED);
+    }
+}
+
+async fn publish_dnd(controller: &Controller, on: bool, ctxt: &SignalContext<'_>) {
+    if controller.shared.apply_dnd(on) {
+        if let Err(error) = controller.do_not_disturb_changed(ctxt).await {
+            eprintln!("den-den-mushi: do-not-disturb signal: {error}");
+        }
+    }
 }
 
 pub async fn serve(
@@ -259,24 +408,24 @@ pub async fn serve(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
     replace: bool,
 ) -> Result<(), String> {
-    let inner = Arc::new(Mutex::new(Inner {
-        next_id: 1,
-        active: HashMap::new(),
-    }));
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel();
-    let command_ui = ui_tx.clone();
+    let shared = Arc::new(Shared {
+        inner: Mutex::new(Inner {
+            next_id: 1,
+            active: HashMap::new(),
+            order: VisibleCards::default(),
+        }),
+        dnd,
+        ui_tx,
+        signal_tx,
+    });
     let service = NotificationService {
-        inner: Arc::clone(&inner),
-        dnd: Arc::clone(&dnd),
-        ui_tx: ui_tx.clone(),
-        signal_tx: signal_tx.clone(),
+        shared: Arc::clone(&shared),
         low_timeout: settings.timeout_low_ms,
         normal_timeout: settings.timeout_normal_ms,
     };
     let controller = Controller {
-        inner: Arc::clone(&inner),
-        dnd,
-        ui_tx,
+        shared: Arc::clone(&shared),
     };
 
     let connection = ConnectionBuilder::session()
@@ -311,6 +460,8 @@ pub async fn serve(
 
     let context = SignalContext::new(&connection, "/org/freedesktop/Notifications")
         .map_err(|error| error.to_string())?;
+    let control_context = SignalContext::new(&connection, "/com/skyguy/DenDenMushi")
+        .map_err(|error| error.to_string())?;
     tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
             let result = match signal {
@@ -327,53 +478,16 @@ pub async fn serve(
         }
     });
 
-    let command_inner = Arc::clone(&inner);
+    let publisher = Controller {
+        shared: Arc::clone(&shared),
+    };
     tokio::spawn(async move {
         while let Some(command) = commands.recv().await {
             match command {
-                UiCommand::Closed { id, reason } => {
-                    let removed = command_inner
-                        .lock()
-                        .expect("notification map")
-                        .active
-                        .remove(&id)
-                        .is_some();
-                    if removed {
-                        let _ = signal_tx.send(OutSignal::Closed { id, reason });
-                        let _ = command_ui.send(UiEvent::Dismiss { id });
-                    }
-                }
-                UiCommand::Action { id, key } => {
-                    let exec = {
-                        let guard = command_inner.lock().expect("notification map");
-                        guard.active.get(&id).and_then(|note| {
-                            if key == "default" {
-                                note.exec.clone()
-                            } else {
-                                None
-                            }
-                        })
-                    };
-                    if let Some(argv) = exec {
-                        spawn_exec(&argv);
-                    }
-                    let _ = signal_tx.send(OutSignal::Action {
-                        id,
-                        key: key.clone(),
-                    });
-                    let removed = command_inner
-                        .lock()
-                        .expect("notification map")
-                        .active
-                        .remove(&id)
-                        .is_some();
-                    if removed {
-                        let _ = signal_tx.send(OutSignal::Closed {
-                            id,
-                            reason: REASON_DISMISSED,
-                        });
-                        let _ = command_ui.send(UiEvent::Dismiss { id });
-                    }
+                UiCommand::Closed { id, reason } => publisher.shared.close(id, reason),
+                UiCommand::Action { id, key } => publisher.shared.invoke_id(id, &key),
+                UiCommand::SetDoNotDisturb(on) => {
+                    publish_dnd(&publisher, on, &control_context).await;
                 }
             }
         }
@@ -489,4 +603,504 @@ fn field_i32(value: &Value<'_>) -> Option<i32> {
     i32::try_from(value)
         .ok()
         .or_else(|| u32::try_from(value).ok().map(|number| number as i32))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+mod tests {
+    use super::*;
+    use crate::model::Urgency;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
+
+    static STATE_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct StateDir {
+        previous: Option<OsString>,
+        dir: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl StateDir {
+        fn lock() -> Self {
+            let _guard = STATE_LOCK.lock().expect("state dir lock");
+            let dir = std::env::temp_dir().join(format!(
+                "den-den-mushi-dnd-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("state dir");
+            let previous = std::env::var_os("XDG_STATE_HOME");
+            std::env::set_var("XDG_STATE_HOME", &dir);
+            Self {
+                previous,
+                dir,
+                _guard,
+            }
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn test_shared() -> (
+        Arc<Shared>,
+        std::sync::mpsc::Receiver<UiEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<OutSignal>,
+    ) {
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                next_id: 1,
+                active: HashMap::new(),
+                order: VisibleCards::default(),
+            }),
+            dnd: Arc::new(AtomicBool::new(false)),
+            ui_tx,
+            signal_tx,
+        });
+        (shared, ui_rx, signal_rx)
+    }
+
+    fn blank(id: u32) -> Note {
+        Note {
+            id,
+            app_name: "notify-send".into(),
+            summary: format!("note {id}"),
+            body: String::new(),
+            icon: IconSource::Glyph(String::new()),
+            glyph_fallback: String::new(),
+            actions: Vec::new(),
+            has_default: true,
+            urgency: Urgency::Normal,
+            battery: false,
+            expire_ms: None,
+            exec: None,
+            created_unix: 0,
+        }
+    }
+
+    fn show(shared: &Shared, id: u32) {
+        shared
+            .inner
+            .lock()
+            .expect("notification map")
+            .upsert(blank(id));
+    }
+
+    #[test]
+    fn dismiss_closes_newest_with_reason_dismissed() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        show(&shared, 4);
+        show(&shared, 7);
+        show(&shared, 4);
+        shared.dismiss(false);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 7,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Dismiss { id: 7 } => {}
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        assert!(ui_rx.try_recv().is_err());
+        shared.dismiss(false);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 4,
+                reason: REASON_DISMISSED,
+            }
+        );
+        shared.dismiss(false);
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn dismiss_all_closes_newest_first() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        show(&shared, 1);
+        show(&shared, 2);
+        show(&shared, 3);
+        shared.dismiss(true);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 3,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 2,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 1,
+                reason: REASON_DISMISSED,
+            }
+        );
+        assert!(signals.try_recv().is_err());
+        let ids: Vec<u32> = std::iter::from_fn(|| ui_rx.try_recv().ok())
+            .map(|event| match event {
+                UiEvent::Dismiss { id } => id,
+                other => panic!("unexpected ui event {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn invoke_runs_default_on_the_newest_card_and_closes_it() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        show(&shared, 1);
+        show(&shared, 2);
+        shared.invoke_newest();
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Action {
+                id: 2,
+                key: "default".into(),
+            }
+        );
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 2,
+                reason: REASON_DISMISSED,
+            }
+        );
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Dismiss { id: 2 } => {}
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        shared.invoke_newest();
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Action {
+                id: 1,
+                key: "default".into(),
+            }
+        );
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 1,
+                reason: REASON_DISMISSED,
+            }
+        );
+        shared.invoke_newest();
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn click_action_and_timeout_share_the_close_path() {
+        let (shared, _, mut signals) = test_shared();
+        show(&shared, 8);
+        shared.invoke_id(8, "pay");
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Action {
+                id: 8,
+                key: "pay".into(),
+            }
+        );
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 8,
+                reason: REASON_DISMISSED,
+            }
+        );
+        show(&shared, 9);
+        shared.close(9, crate::model::REASON_EXPIRED);
+        assert_eq!(
+            signals.try_recv().unwrap(),
+            OutSignal::Closed {
+                id: 9,
+                reason: crate::model::REASON_EXPIRED,
+            }
+        );
+        shared.close(9, REASON_DISMISSED);
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn do_not_disturb_is_stored_once_per_change() {
+        let _state = StateDir::lock();
+        let (shared, _, _) = test_shared();
+        assert!(shared.apply_dnd(true));
+        assert!(theme::read_dnd());
+        assert!(!shared.apply_dnd(true));
+        assert!(shared.apply_dnd(false));
+        assert!(!theme::read_dnd());
+        assert!(!shared.dnd.load(Ordering::SeqCst));
+    }
+
+    /// The CLI and a future dashboard both talk to this object. Drive it on a
+    /// private session bus, without GTK, and check the signals they observe.
+    #[test]
+    fn control_api_signals_on_a_private_bus() {
+        let _state = StateDir::lock();
+        let bus = PrivateBus::start();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio");
+        runtime.block_on(exercise_control_api());
+        drop(bus);
+    }
+
+    struct PrivateBus {
+        child: std::process::Child,
+        socket: PathBuf,
+        previous: Option<OsString>,
+    }
+
+    impl PrivateBus {
+        fn start() -> Self {
+            let socket =
+                std::env::temp_dir().join(format!("den-den-mushi-bus-{}", std::process::id()));
+            let _ = std::fs::remove_file(&socket);
+            let address = format!("unix:path={}", socket.display());
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args([
+                    "--session",
+                    "--nofork",
+                    "--address",
+                    &address,
+                    "--print-pid",
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("dbus-daemon");
+            let stdout = child.stdout.take().expect("dbus pid pipe");
+            let mut pid_line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut pid_line)
+                .expect("dbus pid");
+            assert!(
+                !pid_line.trim().is_empty(),
+                "dbus-daemon did not print a pid"
+            );
+            let previous = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &address);
+            Self {
+                child,
+                socket,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.socket);
+            match self.previous.take() {
+                Some(value) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", value),
+                None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+            }
+        }
+    }
+
+    #[zbus::proxy(
+        interface = "org.freedesktop.Notifications",
+        default_service = "org.freedesktop.Notifications",
+        default_path = "/org/freedesktop/Notifications"
+    )]
+    trait NoteBus {
+        fn notify(
+            &self,
+            app_name: &str,
+            replaces_id: u32,
+            app_icon: &str,
+            summary: &str,
+            body: &str,
+            actions: Vec<String>,
+            hints: HashMap<String, OwnedValue>,
+            expire_timeout: i32,
+        ) -> zbus::Result<u32>;
+
+        #[zbus(signal)]
+        fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
+
+        #[zbus(signal)]
+        fn action_invoked(&self, id: u32, action_key: &str) -> zbus::Result<()>;
+    }
+
+    async fn exercise_control_api() {
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let settings = crate::theme::Settings {
+            margin: None,
+            namespace: "r2-d2-notifications".into(),
+            timeout_low_ms: 4_000,
+            timeout_normal_ms: 5_000,
+        };
+        serve(
+            settings,
+            Arc::new(AtomicBool::new(false)),
+            ui_tx,
+            cmd_rx,
+            false,
+        )
+        .await
+        .expect("serve");
+
+        let connection = zbus::Connection::session().await.expect("session bus");
+        let control = ControlProxy::builder(&connection)
+            .cache_properties(zbus::proxy::CacheProperties::Yes)
+            .build()
+            .await
+            .expect("control proxy");
+        assert!(!control.do_not_disturb().await.expect("read dnd"));
+        let mut dnd_changes = control.receive_do_not_disturb_changed().await;
+
+        control.set_do_not_disturb(true).await.expect("set dnd");
+        assert!(next_dnd_value(&mut dnd_changes, true).await);
+        assert!(theme::read_dnd());
+        control.set_do_not_disturb(false).await.expect("clear dnd");
+        assert!(!next_dnd_value(&mut dnd_changes, false).await);
+        assert!(!theme::read_dnd());
+        // Setting the same value again does not emit another change.
+        control
+            .set_do_not_disturb(false)
+            .await
+            .expect("set dnd again");
+
+        let notes = NoteBusProxy::new(&connection).await.expect("note proxy");
+        let first = notes
+            .notify(
+                "Spotify",
+                0,
+                "",
+                "Now playing",
+                "Jet Plane",
+                vec![],
+                HashMap::new(),
+                -1,
+            )
+            .await
+            .expect("notify");
+        let second = notes
+            .notify(
+                "Mail",
+                0,
+                "",
+                "New message",
+                "From sky",
+                vec!["default".into(), "Open".into()],
+                HashMap::new(),
+                5_000,
+            )
+            .await
+            .expect("notify");
+        assert!(second > first);
+
+        let mut closed = notes
+            .receive_notification_closed()
+            .await
+            .expect("closed stream");
+        let mut invoked = notes.receive_action_invoked().await.expect("action stream");
+
+        control.invoke().await.expect("invoke");
+        let action = next_stream(&mut invoked).await;
+        let action_args = action.args().expect("action args");
+        assert_eq!(action_args.id, second);
+        assert_eq!(action_args.action_key, "default");
+        let close = next_stream(&mut closed).await;
+        let close_args = close.args().expect("close args");
+        assert_eq!(close_args.id, second);
+        assert_eq!(close_args.reason, REASON_DISMISSED);
+        assert_eq!(take_dismissals(&ui_rx), vec![second]);
+
+        control.dismiss(false).await.expect("dismiss newest");
+        let close = next_stream(&mut closed).await;
+        let close_args = close.args().expect("close args");
+        assert_eq!(close_args.id, first);
+        assert_eq!(close_args.reason, REASON_DISMISSED);
+
+        let third = notes
+            .notify("System", 0, "", "One", "", vec![], HashMap::new(), -1)
+            .await
+            .expect("notify");
+        let fourth = notes
+            .notify("System", 0, "", "Two", "", vec![], HashMap::new(), -1)
+            .await
+            .expect("notify");
+        control.dismiss(true).await.expect("dismiss all");
+        let newest = next_stream(&mut closed).await;
+        let older = next_stream(&mut closed).await;
+        assert_eq!(newest.args().expect("close").id, fourth);
+        assert_eq!(newest.args().expect("close").reason, REASON_DISMISSED);
+        assert_eq!(older.args().expect("close").id, third);
+        assert_eq!(older.args().expect("close").reason, REASON_DISMISSED);
+
+        control.dismiss(false).await.expect("dismiss empty");
+        control.invoke().await.expect("invoke empty");
+    }
+
+    fn take_dismissals(events: &std::sync::mpsc::Receiver<UiEvent>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let UiEvent::Dismiss { id } = event {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    async fn next_dnd_value(
+        changes: &mut zbus::proxy::PropertyStream<'_, bool>,
+        want: bool,
+    ) -> bool {
+        use futures_util::StreamExt;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let change = tokio::time::timeout_at(deadline, changes.next())
+                .await
+                .expect("timed out waiting for DoNotDisturb")
+                .expect("dnd stream ended");
+            let on = change.get().await.expect("dnd value");
+            if on == want {
+                return on;
+            }
+        }
+    }
+
+    async fn next_stream<S>(stream: &mut S) -> S::Item
+    where
+        S: futures_util::Stream + Unpin,
+    {
+        use futures_util::StreamExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out waiting for a signal")
+            .expect("signal stream ended")
+    }
 }

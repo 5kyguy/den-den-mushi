@@ -80,12 +80,56 @@ den-den-mushi dnd          # toggle
 den-den-mushi dnd on
 den-den-mushi dnd off
 den-den-mushi dnd status
+den-den-mushi dnd status --json
+den-den-mushi dnd --json --watch
 ```
+
+`--json` prints one object per line, `{"dnd":true}` or `{"dnd":false}`.
+`--watch` prints the current state, then another line each time it changes,
+and exits on SIGINT or when the pipe closes. A bar follows it with
+`den-den-mushi dnd --json --watch`. `--watch` on its own does not toggle.
+`dnd on --json --watch` turns it on, prints that, then keeps watching.
 
 Low and normal notifications are dropped. Critical notifications still show,
 and so do toasts whose app name is `r2-d2-action`, `k2so`, or
 `den-den-mushi`, matching the desktop's own action confirmations. The choice
 is stored in `$XDG_STATE_HOME/den-den-mushi/dnd`.
+
+### Dismiss and invoke
+
+```bash
+den-den-mushi dismiss       # close the newest card
+den-den-mushi dismiss --all
+den-den-mushi invoke        # default action on the newest card, then close it
+```
+
+`dismiss` emits `NotificationClosed` with reason 2 (dismissed by the user).
+`invoke` emits `ActionInvoked` with key `default` and then closes the card
+with reason 2. A left click sends that action when the card has a default
+action. Right click on a card dismisses that card, also with reason 2. An
+empty stack is a no-op.
+
+### Control API
+
+The commands above are clients of one interface, `com.skyguy.DenDenMushi`,
+at `/com/skyguy/DenDenMushi` on the session bus. The daemon that owns
+`org.freedesktop.Notifications` serves it. A control dashboard should call
+this interface, not a second protocol.
+
+| Member | Role |
+| --- | --- |
+| `Dismiss(all: bool)` | Newest card, or every card |
+| `Invoke()` | Default action on the newest card, then close it |
+| `SetDoNotDisturb(on: bool)` | Writes do not disturb |
+| `DoNotDisturb` | Read-only property. `PropertiesChanged` when it changes |
+| `ReloadTheme()`, `Visible()`, `GetDoNotDisturb()` | Theme reload, on-screen ids, and the same flag as the property |
+
+```bash
+busctl --user call org.freedesktop.Notifications /com/skyguy/DenDenMushi \
+  com.skyguy.DenDenMushi Dismiss b false
+busctl --user get-property org.freedesktop.Notifications /com/skyguy/DenDenMushi \
+  com.skyguy.DenDenMushi DoNotDisturb
+```
 
 ### Hyprland
 
@@ -93,7 +137,14 @@ In `hyprland.conf`:
 
 ```
 exec-once = den-den-mushi
+bind = SUPER, N, exec, den-den-mushi dismiss
+bind = SUPER SHIFT, N, exec, den-den-mushi dismiss --all
+bind = SUPER, A, exec, den-den-mushi invoke
 ```
+
+Those binds are examples for this daemon. r2-d2's own Hyprland config, and
+the quickshell bar that would run `den-den-mushi dnd --json --watch`, are
+not changed here.
 
 In r2-d2's `config/hypr/autostart.lua`, next to the other session programs:
 

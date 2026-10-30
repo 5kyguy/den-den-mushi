@@ -7,8 +7,50 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 pub const REASON_EXPIRED: u32 = 1;
+/// Freedesktop `NotificationClosed` reason: the user dismissed the notification.
 pub const REASON_DISMISSED: u32 = 2;
 pub const REASON_CLOSED: u32 = 3;
+
+/// Cards currently on screen, oldest first.
+///
+/// The newest card is the last one shown. A later `replaces_id` updates that
+/// card in place and does not move it, which matches the stack on screen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VisibleCards {
+    ids: Vec<u32>,
+}
+
+impl VisibleCards {
+    pub fn insert_new(&mut self, id: u32) {
+        if id == 0 || self.ids.contains(&id) {
+            return;
+        }
+        self.ids.push(id);
+    }
+
+    pub fn remove(&mut self, id: u32) -> bool {
+        let before = self.ids.len();
+        self.ids.retain(|existing| *existing != id);
+        self.ids.len() != before
+    }
+
+    pub fn newest(&self) -> Option<u32> {
+        self.ids.last().copied()
+    }
+
+    /// Ids a dismiss request closes, newest first.
+    ///
+    /// `all` closes every visible card. Otherwise only the newest one.
+    pub fn dismiss(&mut self, all: bool) -> Vec<u32> {
+        if all {
+            let mut ids = std::mem::take(&mut self.ids);
+            ids.reverse();
+            ids
+        } else {
+            self.ids.pop().into_iter().collect()
+        }
+    }
+}
 
 /// Nerd Font (Material) fallbacks used when a notification has no image.
 /// Code points match JetBrainsMono Nerd Font 3.3.
@@ -329,6 +371,42 @@ pub fn decode_image_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_dismiss_reason_is_two() {
+        assert_eq!(REASON_DISMISSED, 2);
+    }
+
+    #[test]
+    fn dismiss_takes_the_newest_card_or_every_card() {
+        let mut cards = VisibleCards::default();
+        assert!(cards.dismiss(false).is_empty());
+        assert!(cards.dismiss(true).is_empty());
+
+        cards.insert_new(4);
+        cards.insert_new(7);
+        cards.insert_new(9);
+        // A replace of an older id stays where it is.
+        cards.insert_new(4);
+        assert_eq!(cards.newest(), Some(9));
+
+        assert_eq!(cards.dismiss(false), vec![9]);
+        assert_eq!(cards.newest(), Some(7));
+        assert_eq!(cards.dismiss(true), vec![7, 4]);
+        assert!(cards.newest().is_none());
+        assert!(!cards.remove(4));
+    }
+
+    #[test]
+    fn removed_card_is_not_the_newest() {
+        let mut cards = VisibleCards::default();
+        cards.insert_new(1);
+        cards.insert_new(2);
+        cards.insert_new(3);
+        assert!(cards.remove(3));
+        assert_eq!(cards.newest(), Some(2));
+        assert_eq!(cards.dismiss(false), vec![2]);
+    }
 
     #[test]
     fn dnd_keeps_critical_and_desktop_actions() {
