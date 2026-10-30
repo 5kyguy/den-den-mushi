@@ -104,6 +104,10 @@ pub fn history_path() -> PathBuf {
     state_dir().join("history.json")
 }
 
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
 /// Default number of history entries. `history_max` in config.toml overrides it.
 pub const DEFAULT_HISTORY_MAX: usize = 100;
 /// Largest `history_max` that is honored. A larger config value is clamped.
@@ -153,7 +157,8 @@ pub fn write_dnd(on: bool) -> std::io::Result<()> {
     fs::write(path, if on { "1\n" } else { "0\n" })
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct FileConfig {
     pub margin: Option<i32>,
     pub namespace: Option<String>,
@@ -161,6 +166,23 @@ pub struct FileConfig {
     pub timeout_normal_ms: Option<u64>,
     pub history_max: Option<u64>,
     pub history_persist: Option<bool>,
+    pub rules: Vec<crate::rules::AppRule>,
+}
+
+impl FileConfig {
+    pub fn load() -> Self {
+        let path = config_path();
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        match toml::from_str::<Self>(&text) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("den-den-mushi: ignoring config.toml ({error})");
+                Self::default()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -175,15 +197,6 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn load() -> Self {
-        let file = config_dir().join("config.toml");
-        let parsed = fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| toml::from_str::<FileConfig>(&text).ok())
-            .unwrap_or_default();
-        Self::from_config(parsed)
-    }
-
     pub fn from_config(parsed: FileConfig) -> Self {
         Self {
             margin: parsed.margin,
@@ -350,6 +363,16 @@ mod tests {
     fn template_placeholders_fill_with_the_dark_fallback() {
         let filled = render_placeholders(TEMPLATE_CSS, &Palette::fallback_dark());
         assert!(!filled.contains("{{"));
+        for line in TEMPLATE_CSS.lines() {
+            let code = line.trim_start();
+            if code.starts_with("/*") || code.starts_with('*') {
+                continue;
+            }
+            assert!(
+                !code.contains('#'),
+                "stylesheet has a hard-coded color: {line}"
+            );
+        }
         assert!(filled.contains("#0c0c0c"));
         assert!(filled.contains("#ff2a4a"));
         assert!(filled.contains("#ffb000"));
@@ -407,5 +430,40 @@ mod tests {
 
         let huge: FileConfig = toml::from_str("history_max = 999999\n").unwrap();
         assert_eq!(Settings::from_config(huge).history_max, HISTORY_MAX_LIMIT);
+    }
+
+    #[test]
+    fn config_keeps_rules_beside_the_other_settings() {
+        let text = r#"
+history_max = 25
+history_persist = false
+
+[[rules]]
+app = "Spotify"
+muted = true
+timeout = "5s"
+bypass_dnd = true
+
+[[rules]]
+app = "Mail"
+"#;
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        assert_eq!(parsed.history_max, Some(25));
+        assert_eq!(parsed.history_persist, Some(false));
+        assert_eq!(parsed.rules.len(), 2);
+        assert_eq!(parsed.rules[0].app, "Spotify");
+        assert!(parsed.rules[0].muted);
+        assert!(parsed.rules[0].bypass_dnd);
+        assert_eq!(
+            parsed.rules[0].timeout,
+            crate::rules::RuleTimeout::FiveSeconds
+        );
+        assert_eq!(parsed.rules[1].app, "Mail");
+        assert!(!parsed.rules[1].muted);
+        assert_eq!(parsed.rules[1].timeout, crate::rules::RuleTimeout::Default);
+        assert!(!parsed.rules[1].bypass_dnd);
+        let settings = Settings::from_config(parsed);
+        assert_eq!(settings.history_max, 25);
+        assert!(!settings.history_persist);
     }
 }

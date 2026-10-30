@@ -7,6 +7,7 @@ use crate::gaps::{self, Insets};
 use crate::model::{
     display_app, relative_time, IconSource, Note, REASON_DISMISSED, REASON_EXPIRED,
 };
+use crate::panel_ui::{self, Panel};
 use crate::server::{UiCommand, UiEvent};
 use crate::theme::{self, Settings};
 use gtk::gdk::MemoryFormat;
@@ -34,6 +35,8 @@ pub fn run(
     dnd: std::sync::Arc<AtomicBool>,
     events: Receiver<UiEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    runtime: tokio::runtime::Handle,
+    ui_tx: std::sync::mpsc::Sender<UiEvent>,
 ) {
     gtk::init().expect("gtk");
     if let Some(gtk_settings) = gtk::Settings::default() {
@@ -53,7 +56,14 @@ pub fn run(
         // The guard releases the hold on drop. Keep it for the life of the process
         // so an empty notification stack does not quit the daemon.
         std::mem::forget(application.hold());
-        let shell = Shell::new(application, settings.clone(), dnd.clone(), commands.clone());
+        let panel_calls = panel_ui::spawn_panel_client(runtime.clone(), ui_tx.clone());
+        let shell = Shell::new(
+            application,
+            settings.clone(),
+            dnd.clone(),
+            commands.clone(),
+            panel_calls,
+        );
         let shell = Rc::new(RefCell::new(shell));
         let events = Rc::new(RefCell::new(events));
         let shell_for_tick = Rc::clone(&shell);
@@ -130,6 +140,7 @@ struct Shell {
     insets: Insets,
     inset_checks: u32,
     watched: Watched,
+    panel: Panel,
 }
 
 struct Watched {
@@ -144,6 +155,7 @@ impl Shell {
         settings: Settings,
         dnd: std::sync::Arc<AtomicBool>,
         commands: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+        panel_calls: tokio::sync::mpsc::UnboundedSender<panel_ui::PanelCall>,
     ) -> Self {
         let window = gtk::ApplicationWindow::builder()
             .application(application)
@@ -187,6 +199,8 @@ impl Shell {
 
         let insets = current_insets(&settings);
         apply_insets(&window, insets);
+        let panel = Panel::new(application, &settings, panel_calls);
+        panel.apply_insets(insets);
 
         Self {
             window,
@@ -199,6 +213,7 @@ impl Shell {
             insets,
             inset_checks: 0,
             watched: Watched::capture(),
+            panel,
         }
     }
 
@@ -208,6 +223,12 @@ impl Shell {
                 UiEvent::Upsert(note) => self.upsert(note),
                 UiEvent::Dismiss { id } => self.begin_leave(id),
                 UiEvent::ReloadTheme => self.reload_theme(),
+                UiEvent::TogglePanel => self.panel.toggle(),
+                UiEvent::PanelState {
+                    history_json,
+                    rules_json,
+                    dnd,
+                } => self.panel.set_state(&history_json, &rules_json, dnd),
             }
         }
 
@@ -217,6 +238,7 @@ impl Shell {
             if insets != self.insets {
                 self.insets = insets;
                 apply_insets(&self.window, insets);
+                self.panel.apply_insets(insets);
             }
             if self.watched.changed() {
                 self.reload_theme();
@@ -263,6 +285,7 @@ impl Shell {
             !done
         });
         self.sync_window();
+        self.panel.tick();
     }
 
     fn upsert(&mut self, note: Note) {
@@ -634,7 +657,7 @@ fn build_card(note: &Note, commands: tokio::sync::mpsc::UnboundedSender<UiComman
     }
 }
 
-fn is_button(widget: &gtk::Widget) -> bool {
+pub(crate) fn is_button(widget: &gtk::Widget) -> bool {
     let mut current = Some(widget.clone());
     while let Some(widget) = current {
         if widget.is::<gtk::Button>() {
@@ -645,7 +668,7 @@ fn is_button(widget: &gtk::Widget) -> bool {
     false
 }
 
-fn clamp_lines(label: &gtk::Label, lines: i32) {
+pub(crate) fn clamp_lines(label: &gtk::Label, lines: i32) {
     label.set_wrap(true);
     label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     label.set_lines(lines);
@@ -679,7 +702,7 @@ fn update_hover(card: &LiveCard) {
 /// True when the seat pointer is inside `widget`, including its children.
 /// Enter/leave on the card itself flickers when the pointer moves onto the
 /// close button, so the hover state is the pointer position.
-fn pointer_over(widget: &impl IsA<gtk::Widget>) -> bool {
+pub(crate) fn pointer_over(widget: &impl IsA<gtk::Widget>) -> bool {
     let widget = widget.upcast_ref::<gtk::Widget>();
     let Some(root) = widget.root() else {
         return false;
@@ -710,7 +733,7 @@ fn pointer_over(widget: &impl IsA<gtk::Widget>) -> bool {
     point.x() >= 0.0 && point.y() >= 0.0 && point.x() < width && point.y() < height
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     glib::real_time() / 1_000_000
 }
 
@@ -721,7 +744,7 @@ fn update_relative_time(card: &LiveCard) {
     }
 }
 
-fn set_body(label: &gtk::Label, body: &str) {
+pub(crate) fn set_body(label: &gtk::Label, body: &str) {
     let prepared = crate::model::prepare_body(body);
     if prepared.contains('<') && gtk::pango::parse_markup(&prepared, '\0').is_ok() {
         label.set_markup(&prepared);
@@ -855,11 +878,11 @@ glib::wrapper! {
 }
 
 impl SlideBin {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         glib::Object::builder().build()
     }
 
-    fn set_child(&self, child: Option<&gtk::Widget>) {
+    pub(crate) fn set_child(&self, child: Option<&gtk::Widget>) {
         let imp = self.imp();
         if let Some(old) = imp.child.borrow_mut().take() {
             old.unparent();
@@ -870,9 +893,13 @@ impl SlideBin {
         }
     }
 
-    fn set_offset(&self, offset: f64) {
+    pub(crate) fn set_offset(&self, offset: f64) {
         self.imp().offset.set(offset);
         self.queue_draw();
+    }
+
+    pub(crate) fn offset(&self) -> f64 {
+        self.imp().offset.get()
     }
 }
 
