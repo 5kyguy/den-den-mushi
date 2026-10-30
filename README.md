@@ -110,6 +110,56 @@ action is only dismissed. A left click sends the action in the same case.
 Right click on a card dismisses that card, also with reason 2. An empty
 stack is a no-op.
 
+### History
+
+Every notification the daemon receives is kept, newest first, including
+ones do-not-disturb suppresses (those are stored already dismissed). A
+notification with the freedesktop `transient` hint set is shown and not
+saved. That includes boolean `true` and the `1` from
+`notify-send -h int:transient:1`. The fields are the id, app name, icon,
+summary, body, urgency, Unix
+timestamp, actions, and whether it was dismissed. Dismissed means
+freedesktop close reason 2 (the user, `dismiss`, or `invoke`). Expiry and a
+client `CloseNotification` stay in the list with `dismissed` false.
+
+Ids keep going after a restart. The next id is one past the highest id
+already in the file, and a saved id is never issued again while that entry
+exists. `RemoveHistory` and `InvokeHistory` therefore name one entry. A
+`replaces_id` updates that entry only when the notification is still on
+screen.
+
+The icon is a glyph, a theme icon name, or a file path. Pixel data from
+`image-data` is not stored; that notification keeps the fallback glyph.
+
+```bash
+den-den-mushi history
+den-den-mushi history --json
+den-den-mushi history --limit 20
+den-den-mushi history clear
+```
+
+`--json` prints a JSON array, the same document `History` returns. Text
+mode prints one notification per block. `--limit` keeps the newest entries.
+`history clear` deletes the list.
+
+The cap is `history_max` in `~/.config/den-den-mushi/config.toml` (default
+100). Values above 10000 are clamped. `0` keeps nothing. When the cap
+shrinks, older entries are dropped from memory and from disk.
+
+```toml
+history_max = 100
+history_persist = true
+```
+
+`history_persist` defaults to true. Set it false to keep the list in memory
+only; the state file is then neither read nor written.
+
+The file is `$XDG_STATE_HOME/den-den-mushi/history.json` (mode `0600`,
+directory `0700`). It is replaced by renaming a temporary file in that
+directory, so a reader sees the previous list or the new one. The on-disk
+document is `{"version": 1, "entries": [ ... ]}` with the newest entry
+first. Clearing the list writes an empty `entries` array.
+
 ### Control API
 
 The commands above are clients of one interface, `com.skyguy.DenDenMushi`,
@@ -121,16 +171,35 @@ this interface, not a second protocol.
 | --- | --- |
 | `Dismiss(all: bool)` | Newest card, or every card |
 | `Invoke()` | Default action when the newest card has one, then close it |
+| `History()` | JSON array of saved notifications, newest first |
+| `ClearHistory()` | Delete every saved notification |
+| `RemoveHistory(id: u32)` | Delete one saved notification |
+| `InvokeHistory(id: u32)` | Default action if that notification is still on screen |
+| `HistoryChanged` | Emitted when the saved list changes |
 | `SetDoNotDisturb(on: bool)` | Writes do not disturb |
 | `DoNotDisturb` | Read-only property. `PropertiesChanged` when it changes |
 | `ReloadTheme()`, `Visible()`, `GetDoNotDisturb()` | Theme reload, on-screen ids, and the same flag as the property |
 
+`InvokeHistory` emits `ActionInvoked` with key `default` only when that id
+is still on screen and the card offered a default action, then closes it
+with reason 2. If it is still on screen but has no default action, it is
+only dismissed. If the notification has already closed, the call does
+nothing: the app was already told. `HistoryChanged` has no arguments; read
+`History` again when it arrives.
+
 ```bash
 busctl --user call org.freedesktop.Notifications /com/skyguy/DenDenMushi \
   com.skyguy.DenDenMushi Dismiss b false
+busctl --user call org.freedesktop.Notifications /com/skyguy/DenDenMushi \
+  com.skyguy.DenDenMushi History
+busctl --user call org.freedesktop.Notifications /com/skyguy/DenDenMushi \
+  com.skyguy.DenDenMushi ClearHistory
 busctl --user get-property org.freedesktop.Notifications /com/skyguy/DenDenMushi \
   com.skyguy.DenDenMushi DoNotDisturb
 ```
+
+A future history panel should call these methods. This daemon does not
+change quickshell or r2-d2.
 
 ### Hyprland
 
@@ -167,6 +236,8 @@ margin = 8
 namespace = "r2-d2-notifications"
 timeout_low_ms = 4000
 timeout_normal_ms = 5000
+history_max = 100
+history_persist = true
 ```
 
 r2-d2 already blurs this layer. `config/hypr/looknfeel.lua` uses the current

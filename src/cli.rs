@@ -3,6 +3,7 @@
 //! The daemon owns the live state. This module only decides what a command
 //! means and how to print it.
 
+use crate::history::HistoryEntry;
 use serde_json::json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +116,89 @@ pub fn parse_invoke_args(args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryArgs {
+    pub clear: bool,
+    pub json: bool,
+    pub limit: Option<usize>,
+}
+
+pub fn parse_history_args(args: &[&str]) -> Result<HistoryArgs, String> {
+    if args.first() == Some(&"clear") {
+        if args.len() != 1 {
+            return Err("history clear does not take arguments".into());
+        }
+        return Ok(HistoryArgs {
+            clear: true,
+            json: false,
+            limit: None,
+        });
+    }
+    let mut json = false;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--json" => {
+                if json {
+                    return Err("history --json was given twice".into());
+                }
+                json = true;
+            }
+            "--limit" => {
+                if limit.is_some() {
+                    return Err("history --limit was given twice".into());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err("history --limit needs a number".into());
+                };
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    format!("history --limit needs a non-negative number ('{value}')")
+                })?;
+                limit = Some(parsed);
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown history argument '{other}' (use history [--json] [--limit N] or history clear)"
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(HistoryArgs {
+        clear: false,
+        json,
+        limit,
+    })
+}
+
+/// Newest first. `--json` is a JSON array, the same shape `History` returns.
+/// Text mode is one notification per block. `limit` keeps the front of the list.
+pub fn format_history(entries: &[HistoryEntry], json: bool, limit: Option<usize>) -> String {
+    let end = limit.unwrap_or(entries.len()).min(entries.len());
+    let shown = &entries[..end];
+    if json {
+        return serde_json::to_string(shown).unwrap_or_else(|_| "[]".to_string());
+    }
+    let mut lines = Vec::new();
+    for entry in shown {
+        let dismissed = if entry.dismissed { " dismissed" } else { "" };
+        lines.push(format!(
+            "{id}  {app}  {urgency}{dismissed}  {time}  {summary}",
+            id = entry.id,
+            app = entry.app_name,
+            urgency = entry.urgency,
+            time = entry.timestamp,
+            summary = entry.summary,
+        ));
+        if !entry.body.is_empty() {
+            lines.push(format!("    {}", entry.body));
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +287,90 @@ mod tests {
         assert!(parse_dismiss_all(&["all"]).is_err());
         assert!(parse_invoke_args(&[]).is_ok());
         assert!(parse_invoke_args(&["--all"]).is_err());
+    }
+
+    #[test]
+    fn history_command_is_list_or_clear() {
+        assert_eq!(
+            parse_history_args(&[]).unwrap(),
+            HistoryArgs {
+                clear: false,
+                json: false,
+                limit: None,
+            }
+        );
+        assert_eq!(
+            parse_history_args(&["--json", "--limit", "10"]).unwrap(),
+            HistoryArgs {
+                clear: false,
+                json: true,
+                limit: Some(10),
+            }
+        );
+        assert_eq!(
+            parse_history_args(&["--limit", "0", "--json"])
+                .unwrap()
+                .limit,
+            Some(0)
+        );
+        assert!(parse_history_args(&["clear"]).unwrap().clear);
+        assert!(parse_history_args(&["clear", "--json"]).is_err());
+        assert!(parse_history_args(&["--limit"]).is_err());
+        assert!(parse_history_args(&["--limit", "-1"]).is_err());
+        assert!(parse_history_args(&["--limit", "2", "extra"]).is_err());
+        assert!(parse_history_args(&["--json", "--json"]).is_err());
+    }
+
+    #[test]
+    fn history_text_and_json_honor_the_limit() {
+        use crate::history::{HistoryAction, HistoryEntry, HistoryIcon, HistoryIconKind};
+
+        let entries = vec![
+            HistoryEntry {
+                id: 2,
+                app_name: "Spotify".into(),
+                icon: HistoryIcon {
+                    kind: HistoryIconKind::Glyph,
+                    value: String::new(),
+                },
+                summary: "Now playing".into(),
+                body: "Jet Plane".into(),
+                urgency: "normal".into(),
+                timestamp: 1_700_000_000,
+                actions: vec![HistoryAction {
+                    key: "default".into(),
+                    label: "Open".into(),
+                }],
+                dismissed: false,
+            },
+            HistoryEntry {
+                id: 1,
+                app_name: "Mail".into(),
+                icon: HistoryIcon {
+                    kind: HistoryIconKind::IconName,
+                    value: "mail".into(),
+                },
+                summary: "New message".into(),
+                body: String::new(),
+                urgency: "critical".into(),
+                timestamp: 1_700_000_100,
+                actions: Vec::new(),
+                dismissed: true,
+            },
+        ];
+        assert_eq!(
+            format_history(&entries, false, None),
+            "2  Spotify  normal  1700000000  Now playing\n    Jet Plane\n1  Mail  critical dismissed  1700000100  New message"
+        );
+        assert_eq!(
+            format_history(&entries, false, Some(1)),
+            "2  Spotify  normal  1700000000  Now playing\n    Jet Plane"
+        );
+        assert_eq!(format_history(&entries, false, Some(0)), "");
+        let json = format_history(&entries, true, Some(1));
+        let parsed: Vec<HistoryEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, 2);
+        assert_eq!(format_history(&entries, true, Some(0)), "[]");
     }
 }

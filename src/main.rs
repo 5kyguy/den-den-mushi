@@ -2,13 +2,18 @@
 
 mod cli;
 mod gaps;
+mod history;
 mod model;
 mod server;
 mod theme;
 mod ui;
 
-use cli::{format_dnd, next_dnd, parse_dismiss_all, parse_dnd_args, parse_invoke_args, DndArgs};
+use cli::{
+    format_dnd, format_history, next_dnd, parse_dismiss_all, parse_dnd_args, parse_history_args,
+    parse_invoke_args, DndArgs, HistoryArgs,
+};
 use futures_util::StreamExt;
+use history::parse_entries;
 use server::ControlProxy;
 use std::env;
 use std::fs;
@@ -66,6 +71,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("history") => {
+            let rest: Vec<String> = args.collect();
+            let refs: Vec<&str> = rest.iter().map(String::as_str).collect();
+            let parsed = match parse_history_args(&refs) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("den-den-mushi: {error}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(error) = history_cmd(parsed) {
+                eprintln!("den-den-mushi: {error}");
+                std::process::exit(1);
+            }
+        }
         Some("reload") => {
             if let Err(error) = reload() {
                 eprintln!("den-den-mushi: {error}");
@@ -105,6 +125,10 @@ Usage:
   den-den-mushi dismiss --all
                              Close every card
   den-den-mushi invoke       Default action if the newest card has one, then close it
+  den-den-mushi history [--json] [--limit N]
+                             List saved notifications, newest first
+  den-den-mushi history clear
+                             Delete saved notifications
   den-den-mushi dnd          Toggle do not disturb
   den-den-mushi dnd on|off|toggle|status [--json] [--watch]
   den-den-mushi reload       Reread the theme (also SIGUSR1)
@@ -112,11 +136,13 @@ Usage:
 
 Do-not-disturb hides low and normal notifications. Critical notifications,
 and toasts from r2-d2-action, k2so, and den-den-mushi, still show.
-`--json` prints {{\"dnd\":true}}. `--watch` prints the current state, then
-another line whenever it changes, and exits on SIGINT or a closed pipe.
+`--json` prints {{\"dnd\":true}} for do not disturb, or a JSON array for
+history. `--watch` prints the current state, then another line whenever
+it changes, and exits on SIGINT or a closed pipe.
 
 These commands call com.skyguy.DenDenMushi on the session bus
-(Dismiss, Invoke, SetDoNotDisturb, and the DoNotDisturb property)."
+(Dismiss, Invoke, History, ClearHistory, SetDoNotDisturb, and the
+DoNotDisturb property)."
     );
 }
 
@@ -266,6 +292,32 @@ fn reload() -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())
     })
+}
+
+fn history_cmd(args: HistoryArgs) -> Result<(), String> {
+    let json = runtime().block_on(async {
+        let connection = session().await?;
+        let proxy = ControlProxy::new(&connection)
+            .await
+            .map_err(|error| error.to_string())?;
+        if args.clear {
+            proxy
+                .clear_history()
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(String::new());
+        }
+        proxy.history().await.map_err(|error| error.to_string())
+    })?;
+    if args.clear {
+        return Ok(());
+    }
+    let entries = parse_entries(&json)?;
+    let text = format_history(&entries, args.json, args.limit);
+    if args.json || !text.is_empty() {
+        let _ = print_line(&text);
+    }
+    Ok(())
 }
 
 fn visible() -> Result<Vec<u32>, String> {
