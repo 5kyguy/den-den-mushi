@@ -191,8 +191,16 @@ second copy of history or of do not disturb.
 The bottom of the panel is a collapsible list, one row per app that has
 history or a saved rule: mute, a timeout (`default`, `5s`, `10s`,
 `sticky`), and bypass do-not-disturb. Changes go through `SetRule` and
-are written to `~/.config/den-den-mushi/config.toml` immediately. The
+are written to `~/.config/den-den-mushi/rules.toml` immediately. The
 daemon applies them on the next notification.
+
+`config.toml` is read-only. `SetRule` does not rewrite it, so comments,
+key order, and a symlink (for example into another repo) stay as they
+are. `[[rules]]` in `config.toml` are defaults, used only when
+`rules.toml` does not exist yet. Once `rules.toml` exists it is the
+whole list, including after every rule has been cleared. The file is
+replaced by renaming a temporary file in that directory. Its mode is
+`0600`, and the directory mode is `0700`, same as the history file.
 
 Mute does not pop the card up. The notification is still stored in
 history, already dismissed, the same way do-not-disturb stores one,
@@ -200,9 +208,10 @@ unless the sender set `transient`. Mute wins over bypass and over a
 critical urgency. Bypass shows the card while do-not-disturb is on.
 `default` keeps the usual timeout. `5s` and `10s` replace it. `sticky`
 does not auto-expire. A rule that is mute off, timeout `default`, and
-bypass off is removed from the file.
+bypass off is removed from `rules.toml`.
 
 ```toml
+# ~/.config/den-den-mushi/rules.toml
 [[rules]]
 app = "Spotify"
 muted = true
@@ -228,7 +237,7 @@ this interface, not a second protocol.
 | `HistoryChanged` | Emitted when the saved list changes |
 | `TogglePanel()` | Show or hide the notification panel |
 | `Rules()` | JSON array of saved per-app rules |
-| `SetRule(app, muted, timeout, bypass_dnd)` | Write one app's rule. `timeout` is `default`, `5s`, `10s`, or `sticky` |
+| `SetRule(app, muted, timeout, bypass_dnd)` | Write one app's rule to `rules.toml`. `timeout` is `default`, `5s`, `10s`, or `sticky` |
 | `RulesChanged` | Emitted when the saved rules change |
 | `SetDoNotDisturb(on: bool)` | Writes do not disturb |
 | `DoNotDisturb` | Read-only property. `PropertiesChanged` when it changes |
@@ -293,12 +302,6 @@ timeout_low_ms = 4000
 timeout_normal_ms = 5000
 history_max = 100
 history_persist = true
-
-[[rules]]
-app = "Spotify"
-muted = false
-timeout = "default"
-bypass_dnd = false
 ```
 
 r2-d2 already blurs this layer. `config/hypr/looknfeel.lua` uses the current

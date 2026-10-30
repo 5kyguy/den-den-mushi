@@ -108,6 +108,11 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Per-app rules. `config.toml` is not rewritten; this file is.
+pub fn rules_path() -> PathBuf {
+    config_dir().join("rules.toml")
+}
+
 /// Default number of history entries. `history_max` in config.toml overrides it.
 pub const DEFAULT_HISTORY_MAX: usize = 100;
 /// Largest `history_max` that is honored. A larger config value is clamped.
@@ -166,6 +171,8 @@ pub struct FileConfig {
     pub timeout_normal_ms: Option<u64>,
     pub history_max: Option<u64>,
     pub history_persist: Option<bool>,
+    /// Read-only defaults. The daemon does not write `config.toml`.
+    /// `rules.toml` replaces this list once that file exists.
     pub rules: Vec<crate::rules::AppRule>,
 }
 

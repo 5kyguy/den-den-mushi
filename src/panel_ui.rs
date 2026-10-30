@@ -273,7 +273,7 @@ impl Panel {
         panel.set_vexpand(true);
         panel.set_size_request(PANEL_WIDTH, -1);
 
-        let header = gtk::Box::new(Orientation::Horizontal, 8);
+        let header = gtk::Box::new(Orientation::Horizontal, 0);
         header.add_css_class("panel-header");
         header.set_size_request(-1, 48);
         let title = gtk::Label::new(Some("NOTIFICATIONS"));
@@ -967,7 +967,7 @@ fn rule_row(
     bypass.set_valign(Align::Center);
     bypass.set_halign(Align::Center);
 
-    let root = rule_line(&name, &mute, &timeout, &bypass, columns, false);
+    let root = rule_line(&name, &mute, &timeout, &bypass, columns);
     wire_rule(calls, model, &row.app_name, &mute, &timeout, &bypass);
     root
 }
@@ -994,7 +994,7 @@ fn rules_header(columns: &RuleColumns) -> gtk::Box {
     let mute = column_title("MUTE", Align::Center, false);
     let timeout = column_title("TIMEOUT", Align::Center, false);
     let dnd = column_title("DND", Align::Center, false);
-    rule_line(&app, &mute, &timeout, &dnd, columns, true)
+    rule_line(&app, &mute, &timeout, &dnd, columns)
 }
 
 fn column_title(text: &str, align: Align, expand: bool) -> gtk::Label {
@@ -1011,37 +1011,22 @@ fn column_title(text: &str, align: Align, expand: bool) -> gtk::Label {
     label
 }
 
-fn rule_dot(visible: bool) -> gtk::Label {
-    let dot = gtk::Label::new(Some("·"));
-    dot.add_css_class("app");
-    dot.set_valign(Align::Center);
-    if !visible {
-        // Same glyph width as the header dot, so the columns stay put.
-        dot.add_css_class("rules-gap");
-    }
-    dot
-}
-
 fn rule_line(
     app: &impl IsA<gtk::Widget>,
     mute: &impl IsA<gtk::Widget>,
     timeout: &impl IsA<gtk::Widget>,
     dnd: &impl IsA<gtk::Widget>,
     columns: &RuleColumns,
-    dots_visible: bool,
 ) -> gtk::Box {
     columns.mute.add_widget(mute);
     columns.timeout.add_widget(timeout);
     columns.dnd.add_widget(dnd);
-    let root = gtk::Box::new(Orientation::Horizontal, 6);
+    let root = gtk::Box::new(Orientation::Horizontal, 8);
     root.add_css_class("rule-line");
     root.set_hexpand(true);
     root.append(app);
-    root.append(&rule_dot(dots_visible));
     root.append(mute);
-    root.append(&rule_dot(dots_visible));
     root.append(timeout);
-    root.append(&rule_dot(dots_visible));
     root.append(dnd);
     root
 }

@@ -170,7 +170,7 @@ fn run_daemon(replace: bool) {
     let _pid = PidFile::write();
     let config = theme::FileConfig::load();
     let settings = theme::Settings::from_config(config.clone());
-    let rules = rules::RuleSet::new(config.rules);
+    let rules = rules::RuleSet::new(rules::load_rules(&config.rules, &theme::rules_path()));
     let dnd = Arc::new(AtomicBool::new(theme::read_dnd()));
     let (ui_tx, ui_rx) = std::sync::mpsc::channel();
     let ui_tx_panel = ui_tx.clone();
@@ -182,7 +182,7 @@ fn run_daemon(replace: bool) {
     if let Err(error) = runtime.block_on(server::serve(
         settings.clone(),
         rules,
-        theme::config_path(),
+        theme::rules_path(),
         Arc::clone(&dnd),
         ui_tx,
         cmd_rx,

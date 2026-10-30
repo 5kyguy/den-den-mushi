@@ -11,8 +11,11 @@
 
 use crate::model::{allows_popup, Urgency};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TIMEOUT_5S_MS: u64 = 5_000;
 pub const TIMEOUT_10S_MS: u64 = 10_000;
@@ -190,61 +193,122 @@ struct RulesDocument<'a> {
     rules: &'a [AppRule],
 }
 
-/// Rewrite `rules` in `config.toml`, keeping every other key.
+#[derive(Deserialize)]
+struct RulesDocumentOwned {
+    #[serde(default)]
+    rules: Vec<AppRule>,
+}
+
+/// Rules the daemon should apply.
 ///
-/// An empty path is a no-op (tests that only care about the live rules).
-/// A file that is not valid TOML is left untouched.
+/// `config.toml` is never written. `[[rules]]` there are defaults, and only
+/// when `rules.toml` is missing. A present `rules.toml` is the whole list,
+/// including an empty one, so a cleared rule does not come back from the
+/// defaults.
+pub fn load_rules(defaults: &[AppRule], path: &Path) -> Vec<AppRule> {
+    if path.as_os_str().is_empty() {
+        return defaults.to_vec();
+    }
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => defaults.to_vec(),
+        Err(error) => {
+            eprintln!("den-den-mushi: ignoring rules.toml ({error})");
+            defaults.to_vec()
+        }
+        Ok(text) => match parse_rules_file(&text) {
+            Ok(rules) => rules,
+            Err(error) => {
+                eprintln!("den-den-mushi: ignoring rules.toml ({error})");
+                defaults.to_vec()
+            }
+        },
+    }
+}
+
+pub fn parse_rules_file(text: &str) -> Result<Vec<AppRule>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let document: RulesDocumentOwned =
+        toml::from_str(text).map_err(|error| format!("rules.toml could not be read ({error})"))?;
+    Ok(document.rules)
+}
+
+/// Write `rules.toml` by renaming a temp file in the same directory.
+///
+/// This does not open or replace `config.toml`. An empty path is a no-op.
+/// The file mode is `0600` and the directory mode is `0700`, same as
+/// `history.json`.
 pub fn store_rules(path: &Path, rules: &[AppRule]) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    if rules.is_empty() && !path.exists() {
-        return Ok(());
-    }
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let mut value: toml::Value = if existing.trim().is_empty() {
-        toml::Value::Table(toml::map::Map::new())
-    } else {
-        toml::from_str(&existing).map_err(|error| {
-            format!("config.toml could not be read ({error}); rules were not changed")
-        })?
-    };
-    let Some(table) = value.as_table_mut() else {
-        return Err("config.toml is not a table; rules were not changed".into());
-    };
-    if rules.is_empty() {
-        table.remove("rules");
-    } else {
-        let encoded = toml::to_string(&RulesDocument { rules })
-            .map_err(|error| format!("could not encode rules ({error})"))?;
-        let parsed: toml::Value = toml::from_str(&encoded)
-            .map_err(|error| format!("could not encode rules ({error})"))?;
-        let array = parsed
-            .get("rules")
-            .cloned()
-            .unwrap_or_else(|| toml::Value::Array(Vec::new()));
-        table.insert("rules".to_string(), array);
-    }
-    let mut text = toml::to_string_pretty(&value)
-        .map_err(|error| format!("could not write config.toml ({error})"))?;
+    let mut text = toml::to_string_pretty(&RulesDocument { rules })
+        .map_err(|error| format!("could not encode rules ({error})"))?;
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    write_config(path, &text)
+    write_private(path, text.as_bytes()).map_err(|error| error.to_string())
 }
 
-fn write_config(path: &Path, text: &str) -> Result<(), String> {
+/// Readers see the previous file or the new file. A crash during the write
+/// leaves the previous file in place.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    prepare_parent(path)?;
+    let tmp = temp_path(path);
+    if let Err(error) = write_temp(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fs::rename(&tmp, path)?;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text).map_err(|error| error.to_string())?;
-    fs::rename(&tmp, path).map_err(|error| {
-        let _ = fs::remove_file(&tmp);
-        error.to_string()
-    })
+    Ok(())
+}
+
+fn write_temp(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn prepare_parent(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rules.toml");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(".{name}.{}.{nanos}.tmp", std::process::id());
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
+    }
 }
 
 #[cfg(test)]
@@ -371,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn store_rules_keeps_other_config_keys_and_refuses_a_broken_file() {
+    fn rules_toml_wins_over_config_defaults_and_is_private() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -381,44 +445,28 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        fs::write(&path, "history_max = 40\nmargin = 3\n").unwrap();
+        let rules_path = dir.join("rules.toml");
+        let defaults = vec![rule("Mail", true, RuleTimeout::TenSeconds, false)];
+
+        assert_eq!(load_rules(&defaults, &rules_path), defaults);
 
         store_rules(
-            &path,
+            &rules_path,
             &[rule("Spotify", true, RuleTimeout::FiveSeconds, false)],
         )
         .unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        let parsed: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(parsed["history_max"].as_integer(), Some(40));
-        assert_eq!(parsed["margin"].as_integer(), Some(3));
-        let rules = rules_from_value(&parsed);
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].app, "Spotify");
-        assert!(rules[0].muted);
-        assert_eq!(rules[0].timeout, RuleTimeout::FiveSeconds);
+        let mode = fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let loaded = load_rules(&defaults, &rules_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].app, "Spotify");
+        assert!(loaded[0].muted);
+        assert_eq!(loaded[0].timeout, RuleTimeout::FiveSeconds);
 
-        store_rules(&path, &[]).unwrap();
-        let cleared: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(cleared.get("rules").is_none());
-        assert_eq!(cleared["history_max"].as_integer(), Some(40));
-
-        fs::write(&path, "this is not = [\n").unwrap();
-        let error = store_rules(&path, &[rule("Mail", false, RuleTimeout::Sticky, true)]);
-        assert!(error.is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "this is not = [\n");
+        // An empty file is a saved empty list, not a missing file.
+        store_rules(&rules_path, &[]).unwrap();
+        assert!(load_rules(&defaults, &rules_path).is_empty());
 
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    fn rules_from_value(value: &toml::Value) -> Vec<AppRule> {
-        let encoded = toml::to_string(value).unwrap();
-        #[derive(Deserialize)]
-        struct Doc {
-            #[serde(default)]
-            rules: Vec<AppRule>,
-        }
-        toml::from_str::<Doc>(&encoded).unwrap().rules
     }
 }

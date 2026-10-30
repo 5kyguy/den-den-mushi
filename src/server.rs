@@ -74,8 +74,9 @@ struct Shared {
     inner: Mutex<Inner>,
     history: Mutex<HistoryLog>,
     rules: Mutex<RuleSet>,
-    /// Empty in tests that do not touch `config.toml`.
-    config_path: PathBuf,
+    /// `rules.toml`. Empty in tests that do not persist rules.
+    /// `config.toml` is never written.
+    rules_path: PathBuf,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
@@ -348,7 +349,8 @@ impl Controller {
     ///
     /// `timeout` is `default`, `5s`, `10s`, or `sticky`. A rule that is mute
     /// off, timeout `default`, and bypass off is deleted. The new list is
-    /// written to `config.toml` and `RulesChanged` is emitted when it changes.
+    /// written to `rules.toml`. `config.toml` is left untouched.
+    /// `RulesChanged` is emitted when the list changes.
     fn set_rule(
         &self,
         app: &str,
@@ -457,7 +459,7 @@ impl Shared {
     fn with_history(
         history: HistoryLog,
         rules: RuleSet,
-        config_path: PathBuf,
+        rules_path: PathBuf,
         dnd: Arc<AtomicBool>,
         ui_tx: std::sync::mpsc::Sender<UiEvent>,
         signal_tx: tokio::sync::mpsc::UnboundedSender<OutSignal>,
@@ -471,7 +473,7 @@ impl Shared {
             }),
             history: Mutex::new(history),
             rules: Mutex::new(rules),
-            config_path,
+            rules_path,
             dnd,
             ui_tx,
             signal_tx,
@@ -627,8 +629,8 @@ impl Shared {
         if !next.set(rule) {
             return Ok(());
         }
-        if !self.config_path.as_os_str().is_empty() {
-            rules::store_rules(&self.config_path, next.rules())?;
+        if !self.rules_path.as_os_str().is_empty() {
+            rules::store_rules(&self.rules_path, next.rules())?;
         }
         let cleared = next.get(&app).is_none();
         *guard = next;
@@ -668,7 +670,7 @@ async fn publish_dnd(controller: &Controller, on: bool, ctxt: &SignalContext<'_>
 pub async fn serve(
     settings: Settings,
     rules: RuleSet,
-    config_path: PathBuf,
+    rules_path: PathBuf,
     dnd: Arc<AtomicBool>,
     ui_tx: std::sync::mpsc::Sender<UiEvent>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<UiCommand>,
@@ -681,12 +683,7 @@ pub async fn serve(
         theme::history_path(),
     );
     let shared = Arc::new(Shared::with_history(
-        history,
-        rules,
-        config_path,
-        dnd,
-        ui_tx,
-        signal_tx,
+        history, rules, rules_path, dnd, ui_tx, signal_tx,
     ));
     let service = NotificationService {
         shared: Arc::clone(&shared),
@@ -1664,6 +1661,63 @@ mod tests {
     }
 
     #[test]
+    fn set_rule_leaves_a_symlinked_config_byte_identical() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "den-den-mushi-set-rule-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real-config.toml");
+        let config_bytes = b"# comment stays\nhistory_max = 40\nnamespace = \"kept\"\n";
+        std::fs::write(&real, config_bytes).unwrap();
+        let config = dir.join("config.toml");
+        symlink(&real, &config).unwrap();
+        let rules_path = dir.join("rules.toml");
+
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel();
+        let (signal_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared::with_history(
+            HistoryLog::memory(10),
+            RuleSet::new(Vec::new()),
+            rules_path.clone(),
+            Arc::new(AtomicBool::new(false)),
+            ui_tx,
+            signal_tx,
+        ));
+        shared
+            .set_rule(AppRule {
+                app: "Spotify".into(),
+                muted: true,
+                timeout: RuleTimeout::FiveSeconds,
+                bypass_dnd: false,
+            })
+            .unwrap();
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::RulesChanged);
+
+        assert_eq!(std::fs::read(&config).unwrap(), config_bytes);
+        assert_eq!(std::fs::read(&real).unwrap(), config_bytes);
+        assert!(config.symlink_metadata().unwrap().file_type().is_symlink());
+        let saved = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(saved.contains("Spotify"));
+        assert!(saved.contains("5s"));
+        let mode = std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|name| !name.ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn do_not_disturb_is_stored_once_per_change() {
         let _state = StateDir::lock();
         let (shared, _, _) = test_shared();
@@ -1779,14 +1833,18 @@ mod tests {
             history_max: 100,
             history_persist: false,
         };
-        let config_dir = theme::state_dir();
+        let config_dir = theme::state_dir().join("cfg");
         std::fs::create_dir_all(&config_dir).expect("config dir");
-        let config_path = config_dir.join("panel-config.toml");
-        std::fs::write(&config_path, "history_max = 40\nnamespace = \"kept\"\n").expect("config");
+        let real_config = config_dir.join("real-config.toml");
+        let config_bytes = b"# keep this comment\nhistory_max = 40\nnamespace = \"kept\"\n";
+        std::fs::write(&real_config, config_bytes).expect("config");
+        let config_path = config_dir.join("config.toml");
+        std::os::unix::fs::symlink(&real_config, &config_path).expect("symlink");
+        let rules_path = config_dir.join("rules.toml");
         serve(
             settings,
             RuleSet::new(Vec::new()),
-            config_path,
+            rules_path,
             Arc::new(AtomicBool::new(false)),
             ui_tx,
             cmd_rx,
@@ -2035,13 +2093,26 @@ mod tests {
         control: &ControlProxy<'_>,
         ui_rx: &std::sync::mpsc::Receiver<UiEvent>,
     ) {
+        use std::os::unix::fs::PermissionsExt;
+
         while ui_rx.try_recv().is_ok() {}
-        let config_path = theme::state_dir().join("panel-config.toml");
+        let config_dir = theme::state_dir().join("cfg");
+        let config_path = config_dir.join("config.toml");
+        let real_config = config_dir.join("real-config.toml");
+        let rules_path = config_dir.join("rules.toml");
+        let before = std::fs::read(&config_path).unwrap();
+        assert!(config_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(control.rules().await.expect("rules"), "[]");
 
         let rejected = control.set_rule("Spotify", true, "nope", false).await;
         assert!(rejected.is_err(), "a bad timeout is rejected");
         assert_eq!(control.rules().await.expect("rules"), "[]");
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(!rules_path.exists());
 
         let mut changed = control.receive_rules_changed().await.expect("rules stream");
         control
@@ -2056,12 +2127,18 @@ mod tests {
         assert_eq!(rules[0].timeout, RuleTimeout::FiveSeconds);
         assert!(!rules[0].bypass_dnd);
 
-        let text = std::fs::read_to_string(&config_path).unwrap();
-        assert!(text.contains("history_max = 40") || text.contains("history_max = 40"));
-        let parsed: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(parsed["history_max"].as_integer(), Some(40));
-        assert_eq!(parsed["namespace"].as_str(), Some("kept"));
-        assert!(text.contains("Spotify"));
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert_eq!(std::fs::read(&real_config).unwrap(), before);
+        assert!(config_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let rules_text = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(rules_text.contains("Spotify"));
+        assert!(rules_text.contains("5s"));
+        let mode = std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
 
         control
             .set_rule("Spotify", false, "default", false)
@@ -2069,10 +2146,8 @@ mod tests {
             .expect("clear rule");
         next_stream(&mut changed).await;
         assert_eq!(control.rules().await.expect("rules"), "[]");
-        let cleared: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert!(cleared.get("rules").is_none());
-        assert_eq!(cleared["history_max"].as_integer(), Some(40));
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(rules_path.exists());
 
         control.toggle_panel().await.expect("toggle panel");
         match ui_rx.try_recv().expect("toggle event") {
