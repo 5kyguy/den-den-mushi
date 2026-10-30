@@ -28,6 +28,34 @@ owns `org.freedesktop.Notifications`. The layer namespace is
 `r2-d2-notifications`, which is the namespace the Hyprland blur rule in
 r2-d2 already matches.
 
+## Releases
+
+On Arch, install from the AUR:
+
+```bash
+yay -S den-den-mushi          # or paru
+systemctl --user enable --now den-den-mushi.service
+```
+
+The package installs the binary to `/usr/bin/`, the packaged user unit to
+`/usr/lib/systemd/user/` (not enabled by default), the license, and the
+README. It deliberately does not install
+`contrib/dbus/org.freedesktop.Notifications.service` — D-Bus activation
+would fight any other notification server claiming the name.
+
+Releases are tagged `vX.Y.Z`, the version from `Cargo.toml`, and carry a
+prebuilt binary tarball, the `PKGBUILD`, and `SHA256SUMS` on GitHub. Cutting
+one:
+
+```bash
+scripts/release.sh        # checks, tags, pushes, creates the GitHub release
+scripts/aur-publish.sh    # pushes packaging/PKGBUILD + .SRCINFO to the AUR
+```
+
+`aur-publish` needs an AUR account with the SSH key registered. Nothing in
+this repo touches a running desktop; users update through the release, the
+AUR package, or the manual build below.
+
 ## Build
 
 Arch, which is what r2-d2 runs:
@@ -268,7 +296,7 @@ or r2-d2.
 
 In `hyprland.conf`:
 
-```
+```ini
 exec-once = den-den-mushi
 bind = SUPER, N, exec, den-den-mushi panel
 bind = SUPER SHIFT, N, exec, den-den-mushi dismiss
@@ -328,7 +356,7 @@ hl.layer_rule({
 `layerrule = blur, <namespace>` keyword is not the current syntax. On a
 hyprlang config that does not use the lua helper, the equivalent block is:
 
-```
+```ini
 layerrule {
     match:namespace = ^(r2-d2-notifications)$
     blur = on
@@ -343,6 +371,9 @@ compositor, so `hyprctl` gaps, reserved zones, and blur were not observed
 live. Headless sway has neither Hyprland gaps nor layer rules.
 
 ### systemd --user
+
+For manual installs; Arch users get the packaged unit from the AUR package
+instead.
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.local/bin
