@@ -3,9 +3,9 @@
 //! Enter is 180ms, ease-out `cubic-bezier(0.2, 0.8, 0.2, 1)`, from +24px
 //! to 0 with opacity 0 to 1. Exit is 120ms, CSS `ease-in`
 //! `cubic-bezier(0.42, 0, 1, 1)`, from 0 to +24px with opacity to 0.
-//! Restack is a damped spring (stiffness 400, damping 32, mass 1): damping
-//! ratio 0.8, so it settles in about 250ms with a little over one percent
-//! of overshoot.
+//! Restack is a critically damped spring (stiffness 400, damping 40, mass 1),
+//! so it does not overshoot. It starts when the exit finishes
+//! (`RESTACK_DELAY_MS`), after the dismissed card is gone.
 
 use std::time::Duration;
 
@@ -22,8 +22,13 @@ pub const ENTER_CURVE: [f64; 4] = [0.2, 0.8, 0.2, 1.0];
 pub const EXIT_CURVE: [f64; 4] = [0.42, 0.0, 1.0, 1.0];
 
 pub const SPRING_STIFFNESS: f64 = 400.0;
-pub const SPRING_DAMPING: f64 = 32.0;
+/// `2 * sqrt(stiffness * mass)` — critical damping, no overshoot.
+pub const SPRING_DAMPING: f64 = 40.0;
 pub const SPRING_MASS: f64 = 1.0;
+/// The leaving card keeps its slot for the whole exit, then the cards
+/// below spring up. Starting earlier still overlaps, because the exit is
+/// ease-in and the card is still on screen at 60ms.
+pub const RESTACK_DELAY_MS: u64 = EXIT_MS;
 
 pub fn enter_duration(enabled: bool) -> Duration {
     duration_ms(enabled, ENTER_MS)
@@ -35,6 +40,19 @@ pub fn exit_duration(enabled: bool) -> Duration {
 
 pub fn crossfade_duration(enabled: bool) -> Duration {
     duration_ms(enabled, CROSSFADE_MS)
+}
+
+pub fn restack_delay(enabled: bool) -> Duration {
+    duration_ms(enabled, RESTACK_DELAY_MS)
+}
+
+/// A card that is not leaving always keeps its slot. A leaving card keeps
+/// it until `RESTACK_DELAY_MS`. Motion off lets the slot go immediately.
+pub fn holds_stack_slot(leaving: bool, elapsed: Duration, enabled: bool) -> bool {
+    if !leaving {
+        return true;
+    }
+    enabled && elapsed < restack_delay(true)
 }
 
 fn duration_ms(enabled: bool, ms: u64) -> Duration {
@@ -196,6 +214,9 @@ impl Spring {
 pub struct YTrack {
     pub spring: Spring,
     pub anchored: bool,
+    /// Set once a restack has started, so a later sample cannot snap it
+    /// after the leaving card has already been removed.
+    coasting: bool,
 }
 
 impl YTrack {
@@ -203,15 +224,22 @@ impl YTrack {
         Self {
             spring: Spring::at(0.0),
             anchored: false,
+            coasting: false,
         }
     }
 
     pub fn follow(&mut self, y: f64, any_leaving: bool) {
+        if self.spring.resting() {
+            self.coasting = false;
+        }
         let slow = self.spring.velocity.abs() < 0.5;
-        if !self.anchored || (slow && !any_leaving) {
+        if !self.anchored || (slow && !any_leaving && !self.coasting) {
             self.spring.position = y;
             self.spring.velocity = 0.0;
             self.anchored = true;
+            self.coasting = false;
+        } else {
+            self.coasting = true;
         }
         self.spring.target = y;
     }
@@ -332,49 +360,78 @@ mod tests {
     }
 
     #[test]
-    fn spring_settles_in_a_quarter_second_without_a_pixel_of_overshoot() {
-        // 64px is a short card step. The damping ratio is 0.8, so the
-        // overshoot is about 1.5% — under a pixel at this distance.
+    fn spring_is_critically_damped_and_does_not_overshoot() {
+        let critical = 2.0 * (SPRING_STIFFNESS * SPRING_MASS).sqrt();
+        assert!(
+            (SPRING_DAMPING - critical).abs() < 1e-9,
+            "damping {} is not critical ({critical})",
+            SPRING_DAMPING
+        );
+
         let distance = 64.0;
         let mut spring = Spring::at(0.0);
         spring.target = distance;
-        let mut peak = 0.0_f64;
+        let mut overshoot = 0.0_f64;
         let mut t = 0.0;
         let dt = 0.001;
-        while t < 0.25 {
+        let mut at_quarter = 0.0;
+        let mut settled_at = None;
+        while t < 0.8 {
             spring.step(dt);
-            peak = peak.max(spring.position);
             t += dt;
+            overshoot = overshoot.max(spring.position - distance);
+            if at_quarter == 0.0 && t >= 0.25 {
+                at_quarter = spring.position;
+            }
+            if settled_at.is_none() && (spring.position - distance).abs() <= 1.0 {
+                settled_at = Some(t);
+            }
         }
-        let overshoot = peak - distance;
-        assert!(overshoot <= 1.0, "overshoot {overshoot}px at peak {peak}");
+        // ζ = 1 has no overshoot. The tail of a 64px step is about 2.6px at
+        // 250ms and inside 1px just after that, which is the quarter-second settle.
         assert!(
-            (spring.position - distance).abs() <= 1.0,
-            "not settled at 250ms: {}",
-            spring.position
+            overshoot <= 1e-3,
+            "overshoot {overshoot}px, want 0 within float tolerance"
+        );
+        assert!(
+            (at_quarter - distance).abs() <= 3.0,
+            "64px step still far at 250ms: {at_quarter}"
+        );
+        let settled_at = settled_at.expect("spring did not settle");
+        assert!(
+            settled_at <= 0.32,
+            "within 1px at {settled_at}s, want about 250ms"
         );
 
         let mut upward = Spring::at(distance);
         upward.target = 0.0;
-        let mut lowest = distance;
+        let mut undershoot = 0.0_f64;
         t = 0.0;
-        while t < 0.5 {
+        while t < 0.8 {
             upward.step(dt);
-            lowest = lowest.min(upward.position);
             t += dt;
+            undershoot = undershoot.max(-upward.position);
         }
-        let undershoot = -lowest;
         assert!(
-            undershoot <= 1.0,
-            "undershoot {undershoot}px (lowest {lowest})"
+            undershoot <= 1e-3,
+            "undershoot {undershoot}px, want 0 within float tolerance"
         );
-        assert!(
-            upward.position.abs() < 0.1,
-            "did not settle: {}",
-            upward.position
-        );
-        assert!(upward.velocity.abs() < 0.5, "velocity {}", upward.velocity);
-        assert!(upward.resting());
+        assert!(upward.resting(), "position {}", upward.position);
+    }
+
+    #[test]
+    fn restack_waits_out_the_exit_unless_motion_is_off() {
+        assert_eq!(RESTACK_DELAY_MS, EXIT_MS);
+        assert!(holds_stack_slot(false, Duration::ZERO, true));
+        assert!(holds_stack_slot(true, Duration::from_millis(60), true));
+        assert!(holds_stack_slot(true, Duration::from_millis(119), true));
+        assert!(!holds_stack_slot(
+            true,
+            Duration::from_millis(RESTACK_DELAY_MS),
+            true
+        ));
+        assert!(!holds_stack_slot(true, Duration::ZERO, false));
+        assert_eq!(restack_delay(false), Duration::ZERO);
     }
 
     #[test]

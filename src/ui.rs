@@ -398,15 +398,29 @@ impl Shell {
 
     fn retarget(&mut self) {
         let heights: Vec<f64> = self.cards.iter().map(card_height).collect();
-        let leaving: Vec<bool> = self.cards.iter().map(|card| card.leaving).collect();
-        let any_leaving = leaving.iter().any(|leave| *leave);
+        let elapsed: Vec<Duration> = self
+            .cards
+            .iter()
+            .map(|card| card.motion.start.elapsed())
+            .collect();
+        let leaving: Vec<bool> = self
+            .cards
+            .iter()
+            .zip(&elapsed)
+            .map(|(card, elapsed)| {
+                card.leaving && !motion::holds_stack_slot(true, *elapsed, self.settings.motion)
+            })
+            .collect();
+        let any_leaving = self.cards.iter().any(|card| card.leaving);
         let targets = motion::restack_targets(&heights, &leaving, motion::STACK_GAP);
         for (card, target) in self.cards.iter_mut().zip(targets) {
             if card.leaving {
                 continue;
             }
             if let Some(y) = target {
-                card.track.follow(y, any_leaving);
+                // Motion off snaps inside `follow` because `any_leaving` is
+                // ignored, and `integrate` snaps the spring on top of that.
+                card.track.follow(y, any_leaving && self.settings.motion);
             }
         }
     }
