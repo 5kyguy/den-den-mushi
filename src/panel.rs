@@ -68,12 +68,21 @@ pub fn group_history(entries: &[HistoryEntry]) -> Vec<HistoryGroup<'_>> {
 }
 
 /// Glyph drawn on a group header. A stored glyph is used as-is. An icon
-/// name or a file falls back to the same app glyph as a live card.
-pub fn group_glyph(app_name: &str, icon: &HistoryIcon) -> String {
+/// name or a file falls back to the same app glyph as a live card, including
+/// the alert glyph for a critical notification.
+pub fn group_glyph(app_name: &str, icon: &HistoryIcon, urgency: Urgency) -> String {
     if icon.kind == HistoryIconKind::Glyph && !icon.value.is_empty() {
         return icon.value.clone();
     }
-    glyph_for(app_name, "", false, Urgency::Normal, None)
+    glyph_for(app_name, "", false, urgency, None)
+}
+
+pub fn entry_urgency(urgency: &str) -> Urgency {
+    match urgency {
+        "low" => Urgency::Low,
+        "critical" => Urgency::Critical,
+        _ => Urgency::Normal,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +135,7 @@ pub fn rule_rows(entries: &[HistoryEntry], rules: &[AppRule]) -> Vec<RuleRow> {
 mod tests {
     use super::*;
     use crate::history::{HistoryAction, HistoryIcon, HistoryIconKind};
-    use crate::model::GLYPH_MUSIC;
+    use crate::model::{Urgency, GLYPH_MUSIC};
 
     fn entry(id: u32, app: &str, summary: &str, body: &str) -> HistoryEntry {
         HistoryEntry {
@@ -206,13 +215,17 @@ mod tests {
             kind: HistoryIconKind::Glyph,
             value: "★".into(),
         };
-        assert_eq!(group_glyph("Mail", &icon), "★");
+        assert_eq!(group_glyph("Mail", &icon, Urgency::Normal), "★");
         let named = HistoryIcon {
             kind: HistoryIconKind::IconName,
             value: "spotify".into(),
         };
-        assert_eq!(group_glyph("Spotify", &named), GLYPH_MUSIC);
-        assert_ne!(group_glyph("Spotify", &named), "spotify");
+        assert_eq!(group_glyph("Spotify", &named, Urgency::Normal), GLYPH_MUSIC);
+        assert_ne!(group_glyph("Spotify", &named, Urgency::Normal), "spotify");
+        assert_eq!(
+            group_glyph("System", &named, Urgency::Critical),
+            crate::model::GLYPH_ALERT
+        );
     }
 
     #[test]

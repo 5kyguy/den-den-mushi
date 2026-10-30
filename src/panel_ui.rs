@@ -9,8 +9,8 @@
 
 use crate::gaps::Insets;
 use crate::history::parse_entries;
-use crate::model::{display_app, relative_time};
-use crate::panel::{filter_history, group_glyph, group_history, rule_rows, RuleRow};
+use crate::model::{display_app, relative_time, GLYPH_CHEVRON_DOWN, GLYPH_CHEVRON_RIGHT};
+use crate::panel::{entry_urgency, filter_history, group_glyph, group_history, rule_rows, RuleRow};
 use crate::rules::{rules_from_json, AppRule, RuleSet, RuleTimeout};
 use crate::server::{ControlProxy, UiEvent};
 use crate::theme::Settings;
@@ -72,6 +72,7 @@ struct GroupMark {
     app_name: String,
     glyph: String,
     count: usize,
+    critical: bool,
     header: gtk::Box,
 }
 
@@ -88,6 +89,7 @@ pub(crate) struct Panel {
     pin_name: gtk::Label,
     pin_count: gtk::Label,
     rules_box: gtk::Box,
+    clear: gtk::Button,
     dnd_switch: gtk::Switch,
     dnd_line: gtk::Box,
     rows: Vec<HistoryRow>,
@@ -278,6 +280,9 @@ impl Panel {
         title.add_css_class("app");
         title.set_valign(Align::Center);
         title.set_halign(Align::Start);
+        let dnd_label = gtk::Label::new(Some("DND"));
+        dnd_label.add_css_class("dnd-label");
+        dnd_label.set_valign(Align::Center);
         let dnd_switch = gtk::Switch::new();
         dnd_switch.add_css_class("dnd-switch");
         dnd_switch.set_valign(Align::Center);
@@ -288,7 +293,10 @@ impl Panel {
         clear.add_css_class("clear-all");
         clear.set_valign(Align::Center);
         clear.set_halign(Align::End);
+        // Nothing to clear until the first history snapshot arrives.
+        clear.set_sensitive(false);
         header.append(&title);
+        header.append(&dnd_label);
         header.append(&dnd_switch);
         header.append(&spacer);
         header.append(&clear);
@@ -345,15 +353,21 @@ impl Panel {
         let rules_button = gtk::Button::new();
         rules_button.add_css_class("rules-toggle");
         rules_button.set_hexpand(true);
-        let rules_label = gtk::Label::new(Some(if rules_open {
-            "▾  RULES"
+        let rules_chevron = gtk::Label::new(Some(if rules_open {
+            GLYPH_CHEVRON_DOWN
         } else {
-            "▸  RULES"
+            GLYPH_CHEVRON_RIGHT
         }));
-        rules_label.add_css_class("app");
-        rules_label.set_halign(Align::Start);
-        rules_label.set_hexpand(true);
-        rules_button.set_child(Some(&rules_label));
+        rules_chevron.add_css_class("glyph");
+        rules_chevron.set_valign(Align::Center);
+        let rules_text = gtk::Label::new(Some("RULES"));
+        rules_text.add_css_class("app");
+        rules_text.set_valign(Align::Center);
+        let rules_heading = gtk::Box::new(Orientation::Horizontal, 6);
+        rules_heading.set_halign(Align::Start);
+        rules_heading.append(&rules_chevron);
+        rules_heading.append(&rules_text);
+        rules_button.set_child(Some(&rules_heading));
         let rules_box = gtk::Box::new(Orientation::Vertical, 0);
         rules_box.add_css_class("rules-list");
         let rules_scroll = gtk::ScrolledWindow::new();
@@ -420,12 +434,16 @@ impl Panel {
             let _ = calls_dnd.send(PanelCall::SetDoNotDisturb(on));
         });
 
-        let label_toggle = rules_label.clone();
+        let chevron_toggle = rules_chevron.clone();
         let revealer_toggle = revealer.clone();
         rules_button.connect_clicked(move |_| {
             let open = !revealer_toggle.reveals_child();
             revealer_toggle.set_reveal_child(open);
-            label_toggle.set_text(if open { "▾  RULES" } else { "▸  RULES" });
+            chevron_toggle.set_text(if open {
+                GLYPH_CHEVRON_DOWN
+            } else {
+                GLYPH_CHEVRON_RIGHT
+            });
         });
 
         let settled_cb = Rc::clone(&settled);
@@ -474,6 +492,7 @@ impl Panel {
             pin_name,
             pin_count,
             rules_box,
+            clear,
             dnd_switch,
             dnd_line,
             rows: Vec::new(),
@@ -672,6 +691,7 @@ impl Panel {
             let model = self.model.borrow();
             (model.history.clone(), model.query.clone())
         };
+        self.clear.set_sensitive(!history.is_empty());
         self.rows.clear();
         self.groups.clear();
         self.pin.set_visible(false);
@@ -690,9 +710,17 @@ impl Panel {
         }
         self.stack.set_visible_child_name("list");
         for group in group_history(&filtered) {
-            let glyph = group_glyph(group.app_name, &group.entries[0].icon);
+            let newest = group.entries[0];
+            let critical = group
+                .entries
+                .iter()
+                .any(|entry| entry.urgency == "critical");
+            let glyph = group_glyph(group.app_name, &newest.icon, entry_urgency(&newest.urgency));
             let count = group.count();
             let (header, glyph_label, name_label, count_label) = header_widgets(false);
+            if critical {
+                header.add_css_class("critical");
+            }
             glyph_label.set_text(&glyph);
             name_label.set_text(&display_app(group.app_name));
             count_label.set_text(&count.to_string());
@@ -709,6 +737,7 @@ impl Panel {
                 app_name: group.app_name.to_string(),
                 glyph,
                 count,
+                critical,
                 header,
             });
         }
@@ -727,9 +756,11 @@ impl Panel {
             self.rules_box.append(&empty);
             return;
         }
+        let columns = RuleColumns::new();
+        self.rules_box.append(&rules_header(&columns));
         for row in rows {
             self.rules_box
-                .append(&rule_row(row, &self.calls, &self.model));
+                .append(&rule_row(row, &self.calls, &self.model, &columns));
         }
     }
 
@@ -757,6 +788,11 @@ impl Panel {
             return;
         }
         let group = &self.groups[index];
+        if group.critical {
+            self.pin.add_css_class("critical");
+        } else {
+            self.pin.remove_css_class("critical");
+        }
         self.pin_glyph.set_text(&group.glyph);
         self.pin_name.set_text(&display_app(&group.app_name));
         self.pin_count.set_text(&group.count.to_string());
@@ -820,6 +856,9 @@ fn history_card(
 ) -> HistoryRow {
     let root = gtk::Box::new(Orientation::Vertical, 0);
     root.add_css_class("history-card");
+    if entry.urgency == "critical" {
+        root.add_css_class("critical");
+    }
     root.set_hexpand(true);
 
     let content = gtk::Box::new(Orientation::Vertical, 0);
@@ -903,45 +942,107 @@ fn rule_row(
     row: &RuleRow,
     calls: &UnboundedSender<PanelCall>,
     model: &Rc<RefCell<PanelModel>>,
+    columns: &RuleColumns,
 ) -> gtk::Box {
-    let root = gtk::Box::new(Orientation::Horizontal, 6);
-    root.add_css_class("rule-row");
-    root.set_hexpand(true);
     let name = gtk::Label::new(Some(&display_app(&row.app_name)));
     name.add_css_class("rule-name");
     name.set_halign(Align::Start);
     name.set_hexpand(true);
     name.set_xalign(0.0);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    name.set_max_width_chars(16);
 
-    let mute_label = gtk::Label::new(Some("mute"));
-    mute_label.add_css_class("rule-label");
-    mute_label.set_valign(Align::Center);
     let mute = gtk::Switch::new();
     mute.set_active(row.muted);
     mute.set_valign(Align::Center);
+    mute.set_halign(Align::Center);
 
     let timeout = gtk::DropDown::from_strings(&["default", "5s", "10s", "sticky"]);
     timeout.add_css_class("timeout");
     timeout.set_selected(row.timeout.index());
     timeout.set_valign(Align::Center);
+    timeout.set_halign(Align::Center);
 
-    let bypass_label = gtk::Label::new(Some("bypass DND"));
-    bypass_label.add_css_class("rule-label");
-    bypass_label.set_valign(Align::Center);
     let bypass = gtk::Switch::new();
     bypass.set_active(row.bypass_dnd);
     bypass.set_valign(Align::Center);
+    bypass.set_halign(Align::Center);
 
-    root.append(&name);
-    root.append(&mute_label);
-    root.append(&mute);
-    root.append(&timeout);
-    root.append(&bypass_label);
-    root.append(&bypass);
-
+    let root = rule_line(&name, &mute, &timeout, &bypass, columns, false);
     wire_rule(calls, model, &row.app_name, &mute, &timeout, &bypass);
+    root
+}
+
+/// Shared widths so MUTE, TIMEOUT, and DND sit under those header words.
+struct RuleColumns {
+    mute: gtk::SizeGroup,
+    timeout: gtk::SizeGroup,
+    dnd: gtk::SizeGroup,
+}
+
+impl RuleColumns {
+    fn new() -> Self {
+        Self {
+            mute: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
+            timeout: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
+            dnd: gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal),
+        }
+    }
+}
+
+fn rules_header(columns: &RuleColumns) -> gtk::Box {
+    let app = column_title("APP", Align::Start, true);
+    let mute = column_title("MUTE", Align::Center, false);
+    let timeout = column_title("TIMEOUT", Align::Center, false);
+    let dnd = column_title("DND", Align::Center, false);
+    rule_line(&app, &mute, &timeout, &dnd, columns, true)
+}
+
+fn column_title(text: &str, align: Align, expand: bool) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("app");
+    label.set_halign(align);
+    label.set_valign(Align::Center);
+    label.set_hexpand(expand);
+    if align == Align::Center {
+        label.set_xalign(0.5);
+    } else {
+        label.set_xalign(0.0);
+    }
+    label
+}
+
+fn rule_dot(visible: bool) -> gtk::Label {
+    let dot = gtk::Label::new(Some("·"));
+    dot.add_css_class("app");
+    dot.set_valign(Align::Center);
+    if !visible {
+        // Same glyph width as the header dot, so the columns stay put.
+        dot.add_css_class("rules-gap");
+    }
+    dot
+}
+
+fn rule_line(
+    app: &impl IsA<gtk::Widget>,
+    mute: &impl IsA<gtk::Widget>,
+    timeout: &impl IsA<gtk::Widget>,
+    dnd: &impl IsA<gtk::Widget>,
+    columns: &RuleColumns,
+    dots_visible: bool,
+) -> gtk::Box {
+    columns.mute.add_widget(mute);
+    columns.timeout.add_widget(timeout);
+    columns.dnd.add_widget(dnd);
+    let root = gtk::Box::new(Orientation::Horizontal, 6);
+    root.add_css_class("rule-line");
+    root.set_hexpand(true);
+    root.append(app);
+    root.append(&rule_dot(dots_visible));
+    root.append(mute);
+    root.append(&rule_dot(dots_visible));
+    root.append(timeout);
+    root.append(&rule_dot(dots_visible));
+    root.append(dnd);
     root
 }
 

@@ -242,6 +242,12 @@ button.action:hover label {
   margin-right: 12px;
 }
 
+.dnd-label {
+  color: @muted;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .dnd-line {
   background-color: @accent;
   min-height: 2px;
@@ -289,6 +295,15 @@ button.clear-all label {
 
 button.clear-all:hover label {
   color: @text;
+}
+
+button.clear-all:disabled {
+  opacity: 0.4;
+}
+
+button.clear-all:disabled label,
+button.clear-all:disabled:hover label {
+  color: @muted;
 }
 
 entry.panel-search {
@@ -346,6 +361,10 @@ entry.panel-search text placeholder {
   margin-bottom: 0;
 }
 
+.group-header.critical .glyph {
+  color: @danger;
+}
+
 .group-count {
   color: @muted;
   font-size: 11px;
@@ -357,6 +376,10 @@ entry.panel-search text placeholder {
   border: 1px solid @line;
   border-radius: 8px;
   margin-bottom: 6px;
+}
+
+.history-card.critical {
+  border-color: @danger;
 }
 
 .history-group .history-card:last-child {
@@ -403,34 +426,33 @@ button.rules-toggle {
   min-height: 32px;
   margin-top: 4px;
   margin-bottom: 4px;
-  padding: 0;
-}
-
-button.rules-toggle label {
   margin-left: 12px;
   margin-right: 12px;
+  padding: 0;
 }
 
 .rules-list {
   margin-bottom: 8px;
 }
 
-.rule-row {
-  min-height: 28px;
+.rule-line {
   margin-left: 12px;
   margin-right: 12px;
-  margin-bottom: 4px;
+  margin-bottom: 8px;
+}
+
+.rules-list .rule-line:last-child {
+  margin-bottom: 0;
+}
+
+.rules-gap {
+  opacity: 0;
 }
 
 .rule-name {
   color: @text;
   font-size: 12px;
   font-weight: 700;
-}
-
-.rule-label {
-  color: @muted;
-  font-size: 11px;
 }
 
 dropdown.timeout {
