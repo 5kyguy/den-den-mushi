@@ -112,6 +112,9 @@ pub struct Note {
     pub expire_ms: Option<u64>,
     pub exec: Option<Vec<String>>,
     pub created_unix: i64,
+    /// `x-dunst-stack-tag` or `x-canonical-private-synchronous`. The same
+    /// app and tag replace the open card in place.
+    pub stack_tag: Option<String>,
 }
 
 /// Critical notifications, and the desktop's own action toasts, stay visible

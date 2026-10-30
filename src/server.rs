@@ -118,6 +118,7 @@ impl NotificationService {
         let glyph_hint = hint_string(&hints, "r2-d2-glyph");
         let (action_pairs, mut has_default) = pair_actions(&actions);
         let exec = hint_string(&hints, "r2-d2-exec-argv").and_then(|value| parse_exec_argv(&value));
+        let stack_tag = stack_tag_from(&hints);
         if exec.is_some() {
             has_default = true;
         }
@@ -146,13 +147,20 @@ impl NotificationService {
         let mut guard = self.shared.inner.lock().expect("notification map");
         // History is locked only to choose an id. A saved id is not free, so a
         // new notification cannot overwrite that entry. A live replaces_id is
-        // the same notification and keeps its id.
+        // the same notification and keeps its id. A stack tag
+        // (`x-dunst-stack-tag` or `x-canonical-private-synchronous`) does
+        // the same when that app already has the tag on screen.
         let id = {
             let history = self.shared.history.lock().expect("history");
             if suppressed {
                 guard.allocate(replaces_id, &history)
             } else if replaces_id != 0 && guard.active.contains_key(&replaces_id) {
                 replaces_id
+            } else if let Some(existing) = stack_tag
+                .as_deref()
+                .and_then(|tag| guard.stack_owner(&stored_app, tag))
+            {
+                existing
             } else {
                 guard.allocate(0, &history)
             }
@@ -170,6 +178,7 @@ impl NotificationService {
             battery,
             expire_ms: delivery.expire_ms,
             exec,
+            stack_tag: stack_tag.clone(),
             created_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs() as i64)
@@ -450,6 +459,16 @@ impl Inner {
             self.active.remove(id);
         }
         ids
+    }
+
+    /// Open card with this app and stack tag, if one is showing.
+    fn stack_owner(&self, app: &str, tag: &str) -> Option<u32> {
+        if tag.is_empty() {
+            return None;
+        }
+        self.active.iter().find_map(|(id, note)| {
+            (note.app_name == app && note.stack_tag.as_deref() == Some(tag)).then_some(*id)
+        })
     }
 }
 
@@ -790,6 +809,24 @@ fn clamp(value: &str, max: usize) -> String {
     out
 }
 
+/// Dunst's stack tag, and the notify-osd synchronous hint that aliases it.
+fn stack_tag_from(hints: &HashMap<String, OwnedValue>) -> Option<String> {
+    for key in [
+        "x-dunst-stack-tag",
+        "x-canonical-private-synchronous",
+        "private-synchronous",
+        "synchronous",
+    ] {
+        if let Some(tag) = hint_string(hints, key) {
+            let tag = tag.trim();
+            if !tag.is_empty() {
+                return Some(tag.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn hint_string(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
     let value = hints.get(key).or_else(|| {
         let alternate = if key.contains('-') {
@@ -978,6 +1015,7 @@ mod tests {
             expire_ms: None,
             exec: None,
             created_unix: 0,
+            stack_tag: None,
         }
     }
 
@@ -1403,6 +1441,109 @@ mod tests {
         assert_eq!(entries[0].id, kept);
         assert_eq!(entries[0].summary, "hello");
         assert_eq!(entries[1].summary, "kept zero");
+    }
+
+    #[test]
+    fn stack_tag_replaces_the_open_card_from_the_same_app() {
+        let (shared, ui_rx, mut signals) = test_shared();
+        let service = NotificationService {
+            shared: Arc::clone(&shared),
+            low_timeout: 4_000,
+            normal_timeout: 5_000,
+        };
+        let tag = |key: &str, value: &str| {
+            let mut hints = HashMap::new();
+            hints.insert(
+                key.into(),
+                OwnedValue::try_from(Value::from(value)).expect("string hint"),
+            );
+            hints
+        };
+        let first = service.notify(
+            "OSD",
+            0,
+            "",
+            "Muted",
+            "",
+            vec![],
+            tag("x-dunst-stack-tag", "volume"),
+            -1,
+        );
+        let second = service.notify(
+            "OSD",
+            0,
+            "",
+            "Loud",
+            "80%",
+            vec![],
+            tag("x-canonical-private-synchronous", "volume"),
+            -1,
+        );
+        assert_eq!(second, first);
+        let note = shared
+            .inner
+            .lock()
+            .expect("notification map")
+            .active
+            .get(&first)
+            .expect("open card")
+            .clone();
+        assert_eq!(note.summary, "Loud");
+        assert_eq!(note.stack_tag.as_deref(), Some("volume"));
+        assert_eq!(
+            shared.inner.lock().expect("notification map").active.len(),
+            1
+        );
+
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => assert_eq!(note.summary, "Muted"),
+            other => panic!("unexpected ui event {other:?}"),
+        }
+        match ui_rx.try_recv().unwrap() {
+            UiEvent::Upsert(note) => {
+                assert_eq!(note.id, first);
+                assert_eq!(note.summary, "Loud");
+            }
+            other => panic!("unexpected ui event {other:?}"),
+        }
+
+        // Same tag, other app: a new card.
+        let other = service.notify(
+            "Player",
+            0,
+            "",
+            "Nope",
+            "",
+            vec![],
+            tag("synchronous", "volume"),
+            -1,
+        );
+        assert_ne!(other, first);
+
+        // Empty tag does not stack.
+        let blank_tag = service.notify(
+            "OSD",
+            0,
+            "",
+            "Separate",
+            "",
+            vec![],
+            tag("x-dunst-stack-tag", "  "),
+            -1,
+        );
+        assert_ne!(blank_tag, first);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        assert_eq!(signals.try_recv().unwrap(), OutSignal::HistoryChanged);
+        let entries = shared.history.lock().expect("history").entries().to_vec();
+        assert_eq!(entries.iter().filter(|entry| entry.id == first).count(), 1);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == first)
+                .unwrap()
+                .summary,
+            "Loud"
+        );
     }
 
     #[test]
@@ -1832,6 +1973,7 @@ mod tests {
             timeout_normal_ms: 5_000,
             history_max: 100,
             history_persist: false,
+            motion: true,
         };
         let config_dir = theme::state_dir().join("cfg");
         std::fs::create_dir_all(&config_dir).expect("config dir");

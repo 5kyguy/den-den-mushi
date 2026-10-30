@@ -103,6 +103,7 @@ pub(crate) struct Panel {
     calls: UnboundedSender<PanelCall>,
     target_open: bool,
     motion: Option<PanelMotion>,
+    motion_enabled: bool,
 }
 
 pub(crate) fn spawn_panel_client(
@@ -506,6 +507,7 @@ impl Panel {
             calls,
             target_open: false,
             motion: None,
+            motion_enabled: settings.motion,
         }
     }
 
@@ -620,6 +622,21 @@ impl Panel {
         if self.target_open && self.motion.is_none() {
             return;
         }
+        if !self.motion_enabled {
+            self.close_requested.set(false);
+            self.target_open = true;
+            self.target_flag.set(true);
+            self.settled.set(true);
+            self.motion = None;
+            self.slide.set_offset(0.0);
+            self.window.set_visible(true);
+            if self.window.is_layer_window() {
+                self.window.set_keyboard_mode(KeyboardMode::OnDemand);
+            }
+            eprintln!("den-den-mushi: panel open");
+            let _ = self.search.grab_focus();
+            return;
+        }
         let from = self.slide.offset();
         self.close_requested.set(false);
         self.target_open = true;
@@ -644,6 +661,19 @@ impl Panel {
         if !self.target_open {
             return;
         }
+        if !self.motion_enabled {
+            self.target_open = false;
+            self.target_flag.set(false);
+            self.settled.set(false);
+            self.motion = None;
+            self.slide.set_offset(f64::from(PANEL_WIDTH));
+            self.window.set_visible(false);
+            if self.window.is_layer_window() {
+                self.window.set_keyboard_mode(KeyboardMode::None);
+            }
+            eprintln!("den-den-mushi: panel close");
+            return;
+        }
         let from = self.slide.offset();
         self.target_open = false;
         self.target_flag.set(false);
@@ -664,7 +694,7 @@ impl Panel {
         let elapsed = motion.start.elapsed().as_secs_f64();
         let duration = motion.duration.as_secs_f64().max(0.001);
         let t = (elapsed / duration).clamp(0.0, 1.0);
-        // Cubic ease-out, same curve as the cards.
+        // The panel keeps this cubic ease-out. Card curves live in `motion`.
         let eased = 1.0 - (1.0 - t).powi(3);
         let offset = motion.from + (motion.to - motion.from) * eased;
         let opening = motion.to == 0.0;

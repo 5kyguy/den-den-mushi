@@ -409,6 +409,7 @@ mod tests {
             expire_ms: None,
             exec: None,
             created_unix: 1_700_000_000 + i64::from(id),
+            stack_tag: None,
         }
     }
 
