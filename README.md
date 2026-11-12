@@ -69,10 +69,12 @@ release asset.
 
 Releases are tagged `vX.Y.Z`, the version from `Cargo.toml`, and carry a
 prebuilt binary tarball, the `PKGBUILD`, and `SHA256SUMS` on GitHub. Cutting
-one:
+one: bump the version in `Cargo.toml`, add the matching `CHANGELOG.md`
+section, then tag and push — CI (`.github/workflows/release.yml`) builds and
+publishes the release from the changelog:
 
 ```bash
-scripts/release.sh        # checks, tags, pushes, creates the GitHub release
+git tag vX.Y.Z && git push origin main vX.Y.Z
 scripts/aur-publish.sh    # pushes packaging/PKGBUILD + .SRCINFO to the AUR
 ```
 
