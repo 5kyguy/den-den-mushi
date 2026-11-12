@@ -1,6 +1,6 @@
 [package]
 name = "den-den-mushi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Freedesktop notification daemon for Hyprland"
 readme = "README.md"

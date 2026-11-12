@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+          components: clippy, rustfmt
+      - name: system packages
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libgtk4-layer-shell-dev
+      - name: tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: extract release notes from CHANGELOG.md
+        id: notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Strip a leading "v" to match "## [0.1.1]" in the changelog.
+          VERSION="${TAG#v}"
+          # Slice from the matching header up to (not including) the next "## ["
+          # header, or the trailing reference-link footer ("[0.1.x]: ...").
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section && /^\[[0-9]/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > /tmp/notes.md
+
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::No CHANGELOG.md section found for version $VERSION (expected \"## [$VERSION]\"). Aborting before publish."
+            exit 1
+          fi
+
+          echo "path=/tmp/notes.md" >> "$GITHUB_OUTPUT"
+      - run: cargo build --release --locked
+      - name: stage assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          DIST=target/dist
+          STAGE="$DIST/den-den-mushi-$VERSION"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/contrib"
+          cp target/release/den-den-mushi "$STAGE/"
+          cp -r contrib/. "$STAGE/contrib/"
+          cp README.md LICENSE "$STAGE/"
+          cp packaging/PKGBUILD "$DIST/PKGBUILD"
+          tar -C "$DIST" -czf "$DIST/den-den-mushi-$VERSION-x86_64-linux.tar.gz" \
+            "den-den-mushi-$VERSION"
+          (
+            cd "$DIST"
+            sha256sum "den-den-mushi-$VERSION-x86_64-linux.tar.gz" PKGBUILD > SHA256SUMS
+          )
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ steps.notes.outputs.path }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "den-den-mushi $GITHUB_REF_NAME" \
+            --notes-file "$NOTES" \
+            "target/dist/den-den-mushi-$VERSION-x86_64-linux.tar.gz" \
+            "target/dist/PKGBUILD" \
+            "target/dist/SHA256SUMS"
